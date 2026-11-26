@@ -1,0 +1,7 @@
+{
+    "php.validate.executablePath": "C:\\php-8.4.28\\php.exe",
+
+    "terminal.integrated.env.windows": {
+        "PATH": "C:\\php-8.4.28;${env:PATH}"
+    }
+}
