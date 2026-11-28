@@ -42,6 +42,44 @@
     </div>
 </div>
 
+{{-- V2: multi-project overview. "?? 0" keeps the page working if an older cache entry is still stored. --}}
+@php($slaCompliance = $stats['sla_compliance'] ?? null)
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'Active projects', 'value' => $stats['active_projects'] ?? 0, 'icon' => 'bi-kanban', 'color' => 'primary', 'link' => route('projects.index', ['status' => 'active'])])
+    </div>
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'Active clients', 'value' => $stats['active_clients'] ?? 0, 'icon' => 'bi-building', 'color' => 'info', 'link' => route('clients.index', ['status' => 'active'])])
+    </div>
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'Active agents', 'value' => $stats['active_agents'] ?? 0, 'icon' => 'bi-headset', 'color' => 'secondary', 'link' => route('users.index', ['role' => 'agent', 'status' => 'active'])])
+    </div>
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'Global tickets', 'value' => $stats['global_count'] ?? 0, 'icon' => 'bi-globe', 'color' => 'secondary', 'link' => route('tickets.index', ['project_id' => 'global'])])
+    </div>
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'Project tickets', 'value' => $stats['project_ticket_count'] ?? 0, 'icon' => 'bi-diagram-3', 'color' => 'primary'])
+    </div>
+    <div class="col-6 col-md-4 col-xl-2">
+        @include('dashboard._stat-card', ['label' => 'SLA compliance', 'value' => $slaCompliance === null ? '—' : $slaCompliance . '%', 'icon' => 'bi-shield-check', 'color' => 'success', 'link' => route('reports.index')])
+    </div>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-lg-6">
+        <div class="card h-100">
+            <div class="card-header">Tickets by project</div>
+            <div class="card-body"><canvas id="projectChart" height="160"></canvas></div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card h-100">
+            <div class="card-header">Tickets by client</div>
+            <div class="card-body"><canvas id="clientChart" height="160"></canvas></div>
+        </div>
+    </div>
+</div>
+
 {{-- Charts --}}
 <div class="row g-3 mb-4">
     <div class="col-lg-8">
@@ -123,6 +161,8 @@
                 </table>
             </div>
         </div>
+
+        @include('dashboard._recent-activity', ['activities' => $recentActivity])
     </div>
 </div>
 @endsection
@@ -135,6 +175,8 @@
     const trendData = @json($stats['trend']);
     const priorityData = @json($stats['priority_counts']);
     const categoryData = @json($stats['category_counts']);
+    const projectData = @json($stats['project_counts'] ?? []);
+    const clientData = @json($stats['client_counts'] ?? []);
 
     const accentColor = '#4f46e5';
 
@@ -181,5 +223,22 @@
             scales: { x: { beginAtZero: true, ticks: { precision: 0 } } },
         },
     });
+
+    // V2: one small helper for the two simple bar charts (project and client).
+    function simpleBarChart(canvasId, data, color) {
+        new Chart(document.getElementById(canvasId), {
+            type: 'bar',
+            data: {
+                labels: Object.keys(data),
+                datasets: [{ label: 'Tickets', data: Object.values(data), backgroundColor: color, borderRadius: 4 }],
+            },
+            options: {
+                plugins: { legend: { display: false } },
+                scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+            },
+        });
+    }
+    simpleBarChart('projectChart', projectData, accentColor);
+    simpleBarChart('clientChart', clientData, '#0ea5e9');
 </script>
 @endpush

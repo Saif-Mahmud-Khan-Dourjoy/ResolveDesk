@@ -2,9 +2,13 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Client;
 use App\Models\Ticket;
 use App\Models\User;
+use App\Services\TicketService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
@@ -18,7 +22,14 @@ class UserController extends Controller
 
     public function index(Request $request)
     {
-        $query = User::query();
+        $request->validate([
+            'search' => ['nullable', 'string', 'max:100'],
+            'role' => ['nullable', Rule::in(array_keys(User::ROLES))],
+            'status' => ['nullable', Rule::in(['active', 'inactive'])],
+            'client_id' => ['nullable', 'integer'],
+        ]);
+
+        $query = User::with('client');
 
         if ($request->filled('search')) {
             $search = $request->input('search');
@@ -32,6 +43,10 @@ class UserController extends Controller
             $query->where('role', $request->input('role'));
         }
 
+        if ($request->filled('client_id')) {
+            $query->where('client_id', $request->input('client_id'));
+        }
+
         if ($request->input('status') === 'active') {
             $query->where('is_active', true);
         } elseif ($request->input('status') === 'inactive') {
@@ -40,12 +55,12 @@ class UserController extends Controller
 
         $users = $query->orderBy('name')->paginate(self::PER_PAGE)->withQueryString();
 
-        return view('users.index', ['users' => $users]);
+        return view('users.index', ['users' => $users, 'clients' => $this->clientList()]);
     }
 
     public function create()
     {
-        return view('users.create');
+        return view('users.create', ['clients' => $this->clientList()]);
     }
 
     public function store(Request $request)
@@ -56,18 +71,29 @@ class UserController extends Controller
             'password' => ['required', 'string', 'min:8', 'confirmed'],
             'role' => ['required', Rule::in(array_keys(User::ROLES))],
             'is_active' => ['boolean'],
+            // V2: only customers belong to a client organization; a NEW link needs an active client.
+            'client_id' => ['nullable', 'integer', Rule::exists('clients', 'id')->where('is_active', true)],
+        ], [
+            'client_id.exists' => 'Please choose an active client organization.',
         ]);
 
         $validated['is_active'] = $request->boolean('is_active');
+        $clientId = $validated['role'] === User::ROLE_CUSTOMER ? ($validated['client_id'] ?? null) : null;
+        unset($validated['client_id']);
 
         // The 'hashed' cast in the User model hashes the password automatically.
-        $user = User::create($validated);
+        $user = new User($validated);
+        $user->client_id = $clientId; // not mass assignable: set explicitly
+        $user->save();
+        Cache::forget(TicketService::DASHBOARD_CACHE_KEY); // "active agents" count on the admin dashboard
 
         return redirect()->route('users.show', $user)->with('success', "User {$user->name} was created.");
     }
 
     public function show(User $user)
     {
+        $user->load(['client', 'projects']);
+
         $createdCount = $user->createdTickets()->count();
         $assignedActiveCount = $user->assignedTickets()->whereIn('status', Ticket::WORKLOAD_STATUSES)->count();
 
@@ -90,7 +116,7 @@ class UserController extends Controller
 
     public function edit(User $user)
     {
-        return view('users.edit', ['user' => $user]);
+        return view('users.edit', ['user' => $user, 'clients' => $this->clientList($user->client_id)]);
     }
 
     public function update(Request $request, User $user)
@@ -102,18 +128,32 @@ class UserController extends Controller
             'password' => ['nullable', 'string', 'min:8', 'confirmed'], // optional when editing
             'role' => ['required', Rule::in(array_keys(User::ROLES))],
             'is_active' => ['boolean'],
+            'client_id' => ['nullable', 'integer', 'exists:clients,id'],
         ]);
 
         $validated['is_active'] = $request->boolean('is_active');
-
-        $this->ensureRoleOrStatusChangeIsAllowed($user, $validated['role'], $validated['is_active'], $request->user());
+        $newClientId = $validated['role'] === User::ROLE_CUSTOMER && ! empty($validated['client_id'])
+            ? (int) $validated['client_id']
+            : null;
+        unset($validated['client_id']);
 
         // Empty password field = keep the current password.
         if (empty($validated['password'])) {
             unset($validated['password']);
         }
 
-        $user->update($validated);
+        // Check-then-save under a row lock (see lockUser()): the rules below count the
+        // user's tickets, and a parallel assignment must not slip in between.
+        DB::transaction(function () use ($user, $validated, $newClientId, $request) {
+            $lockedUser = $this->lockUser($user);
+
+            $this->ensureRoleOrStatusChangeIsAllowed($lockedUser, $validated['role'], $validated['is_active'], $request->user());
+            $this->ensureClientChangeIsAllowed($lockedUser, $newClientId);
+
+            $lockedUser->client_id = $newClientId;
+            $lockedUser->update($validated);
+        }, 3);
+        Cache::forget(TicketService::DASHBOARD_CACHE_KEY);
 
         return redirect()->route('users.show', $user)->with('success', 'User updated successfully.');
     }
@@ -121,16 +161,77 @@ class UserController extends Controller
     /** Activate / deactivate button on the user list and details page. */
     public function toggleActive(Request $request, User $user)
     {
-        $newIsActive = ! $user->is_active;
+        $newIsActive = DB::transaction(function () use ($user, $request) {
+            $lockedUser = $this->lockUser($user);
+            $newIsActive = ! $lockedUser->is_active;
 
-        $this->ensureRoleOrStatusChangeIsAllowed($user, $user->role, $newIsActive, $request->user());
+            $this->ensureRoleOrStatusChangeIsAllowed($lockedUser, $lockedUser->role, $newIsActive, $request->user());
 
-        $user->is_active = $newIsActive;
-        $user->save();
+            $lockedUser->is_active = $newIsActive;
+            $lockedUser->save();
+
+            return $newIsActive;
+        }, 3);
+        Cache::forget(TicketService::DASHBOARD_CACHE_KEY);
 
         $word = $newIsActive ? 'activated' : 'deactivated';
 
         return back()->with('success', "User {$user->name} was {$word}.");
+    }
+
+    /**
+     * SELECT * FROM users WHERE id = ? FOR UPDATE  (inside the caller's transaction)
+     *
+     * Why: "deactivate agent X" checks "X has no active tickets" and then saves. Without
+     * a lock, an assignment to X that commits between the check and the save would leave
+     * an INACTIVE agent owning a ticket. TicketAssignmentService locks the same row, so
+     * the two operations now run one after the other. Because this lock is the FIRST
+     * statement of the transaction, the ticket count afterwards sees the other commit
+     * (MySQL REPEATABLE READ fixes its snapshot at the first normal SELECT).
+     */
+    private function lockUser(User $user): User
+    {
+        return User::whereKey($user->id)->lockForUpdate()->firstOrFail();
+    }
+
+    /**
+     * V2 rules for changing a customer's client organization.
+     *
+     * - A NEW client must be active (keeping the current, now inactive, client is allowed).
+     * - If the customer already created client-related tickets, the organization cannot
+     *   change: those tickets belong to the old client, and moving the user would let
+     *   them keep seeing another organization's tickets (cross-client leakage).
+     *   Ticket ownership is never transferred silently.
+     */
+    private function ensureClientChangeIsAllowed(User $user, ?int $newClientId): void
+    {
+        if ($user->client_id === $newClientId) {
+            return;
+        }
+
+        if ($newClientId !== null && ! Client::whereKey($newClientId)->where('is_active', true)->exists()) {
+            throw ValidationException::withMessages([
+                'client_id' => 'Please choose an active client organization.',
+            ]);
+        }
+
+        $clientTicketCount = Ticket::where('created_by', $user->id)->whereNotNull('client_id')->count();
+
+        if ($clientTicketCount > 0) {
+            throw ValidationException::withMessages([
+                'client_id' => "This customer already created {$clientTicketCount} ticket(s) for their organization, "
+                    . 'so the organization (and the customer role) cannot be changed. Create a new user account instead.',
+            ]);
+        }
+    }
+
+    /** Active clients for the dropdown, plus the user's current client even if it is inactive. */
+    private function clientList(?int $currentClientId = null)
+    {
+        return Client::where('is_active', true)
+            ->when($currentClientId, fn ($query) => $query->orWhere('id', $currentClientId))
+            ->orderBy('name')
+            ->get(['id', 'name', 'code', 'is_active']);
     }
 
     /**
@@ -154,10 +255,14 @@ class UserController extends Controller
         }
 
         // Rule 2: always keep at least one active administrator.
+        // The other admin rows are locked too: if two admins deactivate EACH OTHER at the
+        // same moment, MySQL reports a deadlock, DB::transaction(..., 3) retries the loser,
+        // and the retry sees the first change and refuses (never 0 active admins).
         if ($user->isAdmin() && $user->is_active) {
             $otherActiveAdmins = User::where('role', User::ROLE_ADMIN)
                 ->where('is_active', true)
                 ->where('id', '!=', $user->id)
+                ->lockForUpdate()
                 ->count();
 
             if ($otherActiveAdmins === 0) {

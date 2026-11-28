@@ -2,11 +2,13 @@
 
 How to find and fix problems in ResolveDesk. Every example uses the real files, routes and tables of this
 project. Part 1 explains the **tools**. Part 2 explains the **common errors** with ResolveDesk examples.
-Part 3 lists **real bugs that were found during development**.
+Part 3 lists **real bugs that were found during development**. Part 4 (V2) covers 409 conflicts, 429 rate limits,
+lock timeouts, Reverb/WebSocket problems, `/broadcasting/auth` 403, the scheduler, attachments and request-id log search.
 
 Related: [System design](10-SYSTEM-DESIGN-GUIDE.md) · [Quick reference](12-QUICK-REFERENCE.md) ·
 [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) · [Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) ·
-[Caching](15-CACHING-GUIDE.md) · [Setup](02-SETUP-GUIDE.md)
+[Caching](15-CACHING-GUIDE.md) · [Setup](02-SETUP-GUIDE.md) · [Concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md) ·
+[Real-time](21-REALTIME-REVERB-ECHO.md) · [Security/logging](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md)
 
 ---
 
@@ -27,7 +29,8 @@ php -v
 ```
 
 Also make sure MariaDB is running (XAMPP Control Panel → MySQL → Start). If it is not, almost every page
-fails with `SQLSTATE[HY000] [2002] No connection could be made because the target machine actively refused it`.
+fails with `SQLSTATE[HY000] [2002] No connection could be made because the target machine actively refused it`,
+and `php artisan test` appears to **hang** (every test waits for the connection timeout).
 
 ## The 6-step debugging routine
 
@@ -65,7 +68,7 @@ ResolveDesk's own log messages (search for these):
 
 | Message | Written by | Meaning |
 |---|---|---|
-| `Could not queue ticket email` | `TicketService::queueEmail()` | The job could not be pushed to the queue after commit. The ticket change is saved. |
+| `Could not queue ticket email` | `TicketNotifier::queueEmail()` | The job could not be pushed to the queue after commit. The ticket change is saved. |
 | `Ticket email failed permanently` | `SendTicketEmail::failed()` | All 3 attempts failed; the job is now in `failed_jobs`. |
 
 Tip: the log can get large. It is safe to empty it while developing (delete the content, not the folder).
@@ -106,7 +109,7 @@ Use logging when you cannot see the screen (queue worker, AJAX, redirects).
 ```php
 use Illuminate\Support\Facades\Log;
 
-// Temporary line inside TicketService::autoAssign(), after findLeastBusyAgent():
+// Temporary line inside TicketAssignmentService::autoAssign(), after findLeastBusyAgent():
 Log::info('Auto assign chose agent', ['ticket' => $lockedTicket->ticket_number, 'agent_id' => $agent?->id]);
 ```
 
@@ -247,7 +250,7 @@ Tests use a separate database `resolvedesk_testing` (set in `phpunit.xml`), so r
 - If you install it later: add the matching Xdebug DLL to `C:\php-8.4.28\ext`, enable it in
   `C:\php-8.4.28\php.ini` (`zend_extension=xdebug`, `xdebug.mode=debug`, `xdebug.start_with_request=yes`),
   install the "PHP Debug" VS Code extension, create a "Listen for Xdebug" launch configuration,
-  then set a breakpoint in e.g. `TicketService::performAssignment()` and click **Assign** in the browser.
+  then set a breakpoint in e.g. `TicketAssignmentService::performAssignment()` and click **Assign** in the browser.
   This is optional and not part of the verified setup.
 
 ## 1.12 Queue worker output
@@ -371,7 +374,7 @@ A typo here fails **inside the queue worker**, not in the browser → check work
 ```php
 return view('tickets.show', [
     'ticket' => $ticket,
-    'agents' => $request->user()->isAdmin() ? $this->agentList() : collect(),
+    'agents' => $user->isAdmin() ? $this->assignmentService->eligibleAgents($ticket) : collect(),
 ]);
 ```
 
@@ -588,7 +591,7 @@ Checklist when the bell/badge never updates or toasts never appear:
 3. **Status code**: 401/419 → session (2.9, 2.12); 422 → bad `since` (2.13); 500 → `laravel.log`.
 4. **Response**: is it JSON? HTML means a `dd()`, an error page or a redirect to `/login`.
 5. **Data**: does the user actually have rows? `$user->unreadNotifications()->count()` in tinker. Remember the
-   actor is never notified about their own action (`notifyUser()` skips `$recipient->id === $actor->id`) and
+   actor is never notified about their own action (`TicketNotifier::notify()` skips `$recipient->id === $actor->id`) and
    inactive recipients are skipped.
 6. **Toast but no new toast?** Toasts only show for `new_notifications` after the first poll, and an id is shown
    once (`shownToastIds`). Reloading the page resets this (first load never toasts).
@@ -777,12 +780,241 @@ stories: symptom → investigation → root cause → fix.
   `test_category_cache_works_with_the_real_database_cache_store`.
 - **Lesson:** test with the same cache store as the real application when serialization matters.
 
+# Part 4 — V2 debugging (concurrency, real-time, scheduler, attachments, operations)
+
+V2 added new failure modes. Each section: **symptom → why → how to check → fix**. Related guides:
+[20 concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md), [21 real-time](21-REALTIME-REVERB-ECHO.md),
+[23 security/errors/logging](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md), [18 deployment](18-PRODUCTION-DEPLOYMENT.md).
+
+New log messages to search for:
+
+| Message | Written by | Meaning |
+|---|---|---|
+| `Real-time broadcast failed; polling fallback will deliver the notification` | `TicketNotifier::broadcast()` (warning) | Reverb unreachable or misconfigured; the operation and the notification row are fine |
+| `Ticket email already sent; skipping duplicate attempt` | `SendTicketEmail::handle()` (info) | A retried job found its `ticket-email-sent:{id}` key |
+| `Attachment file missing on disk` | `TicketAttachmentController::download()` (error) | DB row exists but the file is gone → 404 |
+| `Could not delete orphaned attachment file` | `AttachmentService::deleteFiles()` (warning) | Cleanup after a failed transaction could not delete a file |
+| `SLA check finished: N breach notification(s) sent, M failure(s).` | `CheckSlaBreaches` (console output) | Result of one scheduler run |
+
+## 4.1 Use the request id (`X-Request-Id`) to find log lines
+
+`AddRequestContext` (appended to the `web` middleware group in `bootstrap/app.php`) gives every request an id,
+returns it in the `X-Request-Id` response header and adds `request_id` + `user_id` to every log line of that request:
+
+```text
+[2026-11-26 14:03:11] local.WARNING: Real-time broadcast failed; polling fallback will deliver the notification
+{"user_id":7,"error":"..."} {"request_id":"9b2f6c1e-...","user_id":1}
+```
+
+How to use it:
+
+1. Browser F12 → Network → click the failing request → Response Headers → copy `X-Request-Id`.
+2. Search the log:
+   ```bash
+   grep 9b2f6c1e storage/logs/laravel.log                       # Git Bash
+   ```
+   ```powershell
+   Select-String -Path storage\logs\laravel.log -Pattern 9b2f6c1e # PowerShell
+   ```
+3. A reverse proxy may send its own `X-Request-Id`; it is reused only if it matches `^[A-Za-z0-9\-]{8,64}$`.
+
+Only ids are logged by this middleware — never passwords, cookies or ticket text. Queue worker and scheduler log
+lines do **not** carry the web request id (they run in other processes).
+
+## 4.2 HTTP 409 Conflict / "This ticket was changed by someone else…"
+
+**Why:** optimistic locking. The form sent `version = 4` but the row is already at `version = 5` because another
+user (or the SLA scheduler, or an assignment) changed the ticket after the page was opened.
+`TicketService::updateTicket()` runs `UPDATE ... WHERE id = ? AND version = ? AND status <> 'closed'` → 0 rows →
+`TicketConflictException::staleVersion()`. Transitions and assignments call `Ticket::ensureVersion()` on the locked row.
+
+**What the user sees:** HTML form → redirect back **with their input** and a red flash message (no 409 page exists;
+`resources/views/errors/` has 403, 419 and 429). JSON / `Accept: application/json` → HTTP **409** `{"message": "..."}`.
+
+**Check:**
+```sql
+SELECT id, ticket_number, version, status, updated_at FROM tickets WHERE ticket_number = 'TK-000035';
+SELECT action, old_value, new_value, created_at, user_id FROM ticket_activities WHERE ticket_id = 35 ORDER BY id DESC LIMIT 5;
+```
+The latest activity tells you who changed it (`user_id NULL` = system, e.g. `sla_breached`).
+
+**Other 409 cause:** the same `request_token` re-submitted with **different** content (`replayOrReject()`): the user
+edited an old, already-submitted form. Fix: open a new create form (new token).
+
+**Fix for the user:** reload, review, submit again. **Developer mistakes:** forgetting the hidden
+`<input type="hidden" name="version" ...>` in a new form (then no version check happens for transitions — `version`
+is `nullable` there), or sending the version of a stale model.
+
+> **বাংলায়:** 409 মানে "তুমি যে তথ্য দেখে সিদ্ধান্ত নিয়েছ, সেটা এখন আর সর্বশেষ নয়"। পেজ রিলোড করে নতুন অবস্থা দেখে
+> আবার চেষ্টা করতে হবে। এটা বাগ নয় — অন্যের পরিবর্তন চুপচাপ মুছে ফেলা ঠেকানোর জন্যই এটা ইচ্ছাকৃত।
+
+## 4.3 HTTP 429 Too Many Requests
+
+**Why:** a named rate limiter in `AppServiceProvider::configureRateLimiting()`:
+`ticket-create` 10/min, `comments` 30/min, `notifications` 120/min, `exports` 5/min (per user id, or IP for guests);
+`/health/ready` 60/min per IP; login 5 failures per email + IP (shown as a validation error, not 429).
+
+**Check:** `php artisan route:list --except-vendor -v` shows `throttle:...` on the route. Response headers
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `Retry-After`.
+
+**Typical causes:** an automated test script, many browser tabs polling while the socket is unhealthy
+(each tab polls every 5 s = 12/min), a JS loop calling the feed repeatedly.
+
+**Fix:** wait a minute. Locally only: `php artisan cache:clear` resets the counters (they live in the cache store).
+Do not raise limits to hide a JS bug.
+
+## 4.4 Assignment lock timeout: "Another assignment is being processed right now"
+
+**Why:** `TicketAssignmentService::withAssignmentLock()` waited `assignment_lock.wait_seconds` (5 s) for
+`Cache::lock('ticket-assignment')` and got `LockTimeoutException`, converted to a validation error (redirect back),
+**not** a 409.
+
+**Check:**
+```sql
+SELECT `key`, owner, FROM_UNIXTIME(expiration) FROM cache_locks;
+```
+- A row with a future expiration → an assignment is running (or a slow one is stuck — Reverb hanging is no longer a
+  cause, because broadcasts are held until after the lock).
+- A row with a past expiration is harmless; the next acquire takes it over.
+- Tests use `CACHE_STORE=array`, so `cache_locks` is not touched there.
+
+**Fix:** retry. If it happens often: look for slow queries inside the locked section (`findLeastBusyAgent()`), check
+DB lock waits (`SHOW ENGINE INNODB STATUS`), and keep network calls outside the lock.
+
+**Database lock wait** (different problem): `SQLSTATE[HY000]: General error: 1205 Lock wait timeout exceeded` means a
+row lock (`FOR UPDATE`) was held longer than `innodb_lock_wait_timeout` (50 s default) — usually a forgotten open
+transaction in tinker. Deadlocks (`1213`) are retried automatically 3 times by `DB::transaction(..., 3)`.
+
+## 4.5 Real-time toast does not appear (Reverb / WebSocket)
+
+Work through the chain from left to right:
+
+```text
+TicketNotifier (after commit) -> Reverb :8080 -> browser WebSocket -> Echo channel users.{id}
+   -> event .notification.created -> 'resolvedesk:realtime-notification' -> notifications.js -> GET /notifications/feed -> toast
+```
+
+| Check | How | If wrong |
+|---|---|---|
+| Is the notification in the DB? | `SELECT id, created_at FROM notifications WHERE notifiable_id = 7 ORDER BY created_at DESC LIMIT 3;` | Not a real-time problem — recipient rules (actor/inactive skipped) |
+| Is Reverb running? | Terminal shows `php artisan reverb:start`; use `--debug` to print connections and messages | Start it; check port 8080 is free (`netstat -ano \| findstr 8080`) |
+| Does Laravel reach Reverb? | Log line `Real-time broadcast failed…` | `BROADCAST_CONNECTION=reverb`, `REVERB_APP_ID/KEY/SECRET`, `REVERB_HOST/PORT/SCHEME`; `php artisan config:clear`; restart Reverb after `.env` changes |
+| Is the bundle loaded? | View source: a `/build/assets/realtime-*.js` script; `public/build/manifest.json` exists | `npm run build` (the layout skips `@vite` when there is no manifest) |
+| Correct browser settings? | Bundle built with the right `VITE_REVERB_APP_KEY/HOST/PORT/SCHEME` | Fix `.env`, **rebuild** (`VITE_*` values are baked in at build time) |
+| WebSocket connected? | F12 → Network → **WS** filter → `ws://localhost:8080/app/<key>` → Messages tab shows `pusher:connection_established` | Firewall/port/scheme; `forceTLS` follows `VITE_REVERB_SCHEME` |
+| Channel subscribed? | WS messages contain `pusher_internal:subscription_succeeded` for `private-users.7`; Console shows no "Real-time channel subscription failed" | See 4.6 (`/broadcasting/auth`) |
+| Event received? | WS message with event `notification.created` and `{"notification_id":"..."}` | Event name must match `broadcastAs()` — listener uses a leading dot: `.notification.created` |
+| Feed fetched? | Network: `GET /notifications/feed` right after the WS message | `notifications.js` loaded? 429 (4.3)? 401/419 session? |
+
+While the socket is unhealthy, `notifications.js` keeps polling every 5 s (30 s in a hidden tab), so a missing toast
+for longer than ~5 s means the polling path is broken too (see 2.15).
+
+Known behaviour, not a bug: each open tab has its own WebSocket and shows its own toast.
+
+> **বাংলায়:** Real-time সমস্যা খোঁজার সময় শিকলের মতো ধাপে ধাপে দেখুন: ডাটাবেসে নোটিফিকেশন আছে কি না → Reverb চলছে কি
+> না → ব্রাউজারে WebSocket কানেক্ট হয়েছে কি না → চ্যানেল subscribe হয়েছে কি না → ইভেন্ট এসেছে কি না → feed থেকে ডাটা
+> এসেছে কি না। যে ধাপে ভাঙছে, সমস্যা সেখানেই।
+
+## 4.6 `POST /broadcasting/auth` returns 403 (or 401/419)
+
+Echo calls this framework route before joining a private channel. Laravel runs the callback in `routes/channels.php`:
+
+```php
+Broadcast::channel('users.{userId}', function (User $user, $userId) {
+    return $user->id === (int) $userId && $user->is_active;
+});
+```
+
+| Status | Cause | Fix |
+|---|---|---|
+| 403 | Subscribing to another user's channel (the `<meta name="user-id">` was edited, or a stale page after logging in as someone else) | Reload the page; the meta tag must contain the logged-in user's id |
+| 403 | User was deactivated (`is_active = 0`) | Expected |
+| 401 / redirect to login | Session expired or no session cookie (e.g. Reverb host on another domain without cookies) | Log in again; serve app and auth from the same site |
+| 419 | CSRF token missing/old — Echo reads `<meta name="csrf-token">` | Reload the page |
+
+Tests: `RealtimeAndDeliveryTest::test_user_can_subscribe_only_to_their_own_private_channel`,
+`test_guest_cannot_authorize_a_private_channel`.
+
+## 4.7 Scheduler not running / SLA reminders missing
+
+**Why:** `routes/console.php` defines `Schedule::command('tickets:check-sla')->everyMinute()->withoutOverlapping()`,
+but **nothing runs it** unless `php artisan schedule:work` (local) or the cron line
+`* * * * * php artisan schedule:run` (server) is active.
+
+**Check, in order:**
+1. `php artisan schedule:list` → the task is listed with its next run time.
+2. Is `schedule:work` running in a terminal (with PHP 8.4)? On a server: `crontab -l` and the cron log.
+3. Run the command by hand: `php artisan tickets:check-sla` → "SLA check finished: N breach notification(s) sent…".
+4. "0 sent" but you expected one → the ticket does not match:
+   ```sql
+   SELECT id, status, due_at, sla_notified_at FROM tickets
+   WHERE status IN ('open','assigned','in_progress') AND due_at < NOW() AND sla_notified_at IS NULL;
+   ```
+   Already notified (`sla_notified_at` set), resolved, or `due_at` in the future. Remember timestamps are in
+   `Asia/Dhaka` (`APP_TIMEZONE`) — a wrong timezone makes `NOW()` comparisons look off by hours.
+5. Notified but nobody saw it → recipient = assigned **active** agent, else every active admin; check `notifications`.
+6. A previous run is "stuck" → `withoutOverlapping()` holds a lock in the cache store; it expires after 24 h by
+   default. `php artisan schedule:clear-cache` removes overlap locks.
+
+The command returns a non-zero exit code when one or more tickets failed (`report($exception)` writes them to the log)
+— one broken ticket does not stop the others.
+
+## 4.8 Attachment errors (422, 403, 404)
+
+| Symptom | Cause | Check / fix |
+|---|---|---|
+| Validation error "Allowed file types: pdf, png, …" | Extension **or** detected MIME type not allowed (`extensions:` + `mimes:` rules) — e.g. `report.pdf` that is really an `.exe` | `config/resolvedesk.php` → `allowed_extensions`; `fileinfo` extension enabled in `php.ini` |
+| "Each attachment may be at most 5 MB" | `max_file_kb` | Also check PHP's own limits: `upload_max_filesize` and `post_max_size` in `C:\php-8.4.28\php.ini` — if PHP rejects the upload first, Laravel sees no file or an empty POST (often a confusing 419 or "field required") |
+| More than 5 files rejected | `max_files` | Expected |
+| **403** on download | `TicketPolicy::downloadAttachment()`: user cannot view the ticket, the attachment belongs to a **different** ticket than the URL, or it belongs to an internal note and the user is a customer | Expected security behaviour; verify with `Gate::forUser($user)->allows('downloadAttachment', [$ticket, $attachment])` in tinker |
+| **404** on download | Route model binding: attachment id does not exist → 404; or the row exists but the file is missing on disk → log `Attachment file missing on disk` | `Storage::disk('local')->exists($attachment->storage_path)`; files live under `storage/app/private/ticket-attachments/YYYY/MM/` — restore from backup ([19](19-BACKUP-AND-RECOVERY.md)) |
+| Files on disk without DB rows | A failed transaction whose cleanup also failed (log `Could not delete orphaned attachment file`) | Safe to delete manually after checking `ticket_attachments.storage_path` |
+
+## 4.9 Ticket scope errors on create
+
+Messages from `TicketService::resolveScope()` (shown under the project/client field):
+"You can only create tickets for projects you support." (agent not in `project_user`), "The selected project is not used
+by this client organization." (no `client_project` row), "Your account is not linked to a client organization…"
+(standalone customer chose a project), "Please choose an active project." Check the pivot tables:
+
+```sql
+SELECT * FROM project_user WHERE user_id = 4;
+SELECT * FROM client_project WHERE client_id = 1;
+SELECT id, role, client_id, is_active FROM users WHERE id = 9;
+```
+
+Empty project dropdown → `GET /tickets/project-options?client_id=…` in the Network tab; it returns only projects the
+**current** user may choose (`TicketController::selectableProjects()`).
+
+## 4.10 Tests hang or fail in V2-specific ways
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `php artisan test` hangs with no output | MariaDB is stopped — each test waits for the connection timeout | Start MariaDB, `Ctrl+C`, run again |
+| `MySqlConcurrencyTest` fails | It opens a second real connection (`mysql_second`) and commits for real, then truncates tables in `tearDown()`; it needs MySQL/MariaDB | Run against `resolvedesk_testing` on MariaDB, never SQLite and never the dev DB |
+| A request token test fails with 422 | New test forgot `request_token` (`(string) Str::uuid()`) | Every ticket-creation POST needs it since V2 |
+| Edit test returns a redirect with error | Missing `version` in the PUT data | Send `'version' => $ticket->version` |
+| Broadcasting errors in tests | `phpunit.xml` sets `BROADCAST_CONNECTION=null`; tests that need events use `Event::fake()` | Do not change `phpunit.xml` to `reverb` |
+
+## 4.11 `php artisan serve` uses the wrong database
+
+`serve` passes only a short allow-list of environment variables (e.g. `APP_ENV`, `PATH`) to the PHP server process it
+starts, so `$env:DB_DATABASE="copy"; php artisan serve` still uses `DB_DATABASE` from `.env`. Change `.env`
+temporarily, or run `php -S 127.0.0.1:8000 -t public vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php`
+in a shell where the variable is set.
+
+## 4.12 Readiness and liveness checks
+
+- `GET /up` (framework) → 200 if Laravel boots.
+- `GET /health/ready` → `{"status":"ok"}` or **503** `{"status":"unavailable"}` when `SELECT 1` fails; the exception is
+  reported to the log (search for the request id). It never shows error details.
+
 ---
 
 ## Final checklist after fixing anything
 
 ```bash
-php artisan test                         # 85 feature tests, isolated DB resolvedesk_testing
+php artisan test                         # 170 feature tests (last run: 170 passed / 682 assertions), DB resolvedesk_testing
 php artisan test --filter=CacheTest      # run one file/class
 php artisan test --filter=test_feed_with_since_returns_new_notifications
 ```

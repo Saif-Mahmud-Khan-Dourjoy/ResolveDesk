@@ -2,12 +2,17 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Requests\StoreTicketRequest;
 use App\Models\Category;
+use App\Models\Client;
+use App\Models\Project;
 use App\Models\Ticket;
 use App\Models\User;
+use App\Services\TicketAssignmentService;
 use App\Services\TicketService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
@@ -17,7 +22,9 @@ use Illuminate\Validation\ValidationException;
  *
  * Flow of every workflow action:
  *   route -> middleware (auth, active[, role:admin]) -> this controller
- *   -> Gate::authorize() (TicketPolicy) -> validation -> TicketService -> redirect with message
+ *   -> Gate::authorize() (TicketPolicy) -> validation -> service -> redirect with message
+ *
+ * V2: every mutation form sends the hidden "version" field (optimistic locking).
  */
 class TicketController extends Controller
 {
@@ -25,12 +32,13 @@ class TicketController extends Controller
     private const PER_PAGE = 15;
 
     /**
-     * Laravel's service container creates TicketService automatically and
-     * passes it in here (constructor dependency injection).
+     * Laravel's service container creates the services automatically and
+     * passes them in here (constructor dependency injection).
      */
-    public function __construct(private TicketService $ticketService)
-    {
-    }
+    public function __construct(
+        private TicketService $ticketService,
+        private TicketAssignmentService $assignmentService,
+    ) {}
 
     // =========================================================================
     // List with search and filters
@@ -46,15 +54,40 @@ class TicketController extends Controller
             'status' => ['nullable', Rule::in(array_keys(Ticket::STATUSES))],
             'priority' => ['nullable', Rule::in(array_keys(Ticket::PRIORITIES))],
             'category_id' => ['nullable', 'integer'],
+            'project_id' => ['nullable', 'regex:/^(global|\d+)$/'],   // a project id or "global"
+            'client_id' => ['nullable', 'regex:/^(internal|\d+)$/'],  // a client id or "internal"
+            'assigned_to' => ['nullable', 'regex:/^(unassigned|\d+)$/'],
             'date_from' => ['nullable', 'date'],
             'date_to' => ['nullable', 'date', 'after_or_equal:date_from'],
         ]);
 
-        // with(): eager loading. Loads categories, creators and agents in 3 extra
-        // queries in total instead of 3 queries PER ROW (avoids the N+1 problem).
-        $query = Ticket::with(['category', 'creator', 'assignedAgent'])
-            ->visibleTo($user);
+        // with(): eager loading - one extra query per relationship for the whole
+        // page instead of one per row (avoids the N+1 problem).
+        $query = Ticket::with(['category', 'project', 'client', 'creator', 'assignedAgent'])
+            ->visibleTo($user); // authorization FIRST, filters only narrow it further
 
+        $this->applyFilters($query, $request, $user);
+
+        // withQueryString(): keeps the filters in the pagination links.
+        $tickets = $query->latest()->paginate(self::PER_PAGE)->withQueryString();
+
+        return view('tickets.index', [
+            'tickets' => $tickets,
+            'categories' => Category::orderBy('name')->get(['id', 'name']), // include inactive for filtering old tickets
+            // Admin: every project. Others: only projects that appear in tickets they may see,
+            // so a customer never learns the names of other clients' products.
+            'projects' => $user->isAdmin()
+                ? Project::orderBy('code')->get(['id', 'code', 'name'])
+                : Project::whereIn('id', Ticket::visibleTo($user)->whereNotNull('project_id')->select('project_id'))
+                    ->orderBy('code')->get(['id', 'code', 'name']),
+            'clients' => $user->isAdmin() ? Client::orderBy('code')->get(['id', 'code', 'name']) : collect(),
+            'agents' => $user->isAdmin() ? $this->activeAgents() : collect(),
+        ]);
+    }
+
+    /** Shared by the ticket list and the report page/CSV export (same rules everywhere). */
+    public static function applyFilters($query, Request $request, User $user): void
+    {
         if ($request->filled('search')) {
             $search = $request->input('search');
             $query->where(function ($subQuery) use ($search) {
@@ -63,24 +96,34 @@ class TicketController extends Controller
             });
         }
 
-        if ($request->filled('status')) {
-            $query->where('status', $request->input('status'));
+        foreach (['status', 'priority', 'category_id'] as $column) {
+            if ($request->filled($column)) {
+                $query->where($column, $request->input($column));
+            }
         }
 
-        if ($request->filled('priority')) {
-            $query->where('priority', $request->input('priority'));
+        if ($request->filled('project_id')) {
+            if ($request->input('project_id') === 'global') {
+                $query->whereNull('project_id');
+            } else {
+                $query->where('project_id', (int) $request->input('project_id'));
+            }
         }
 
-        if ($request->filled('category_id')) {
-            $query->where('category_id', $request->input('category_id'));
+        // Client and agent filters are admin-only (others already see only their own tickets).
+        if ($user->isAdmin() && $request->filled('client_id')) {
+            if ($request->input('client_id') === 'internal') {
+                $query->whereNull('client_id');
+            } else {
+                $query->where('client_id', (int) $request->input('client_id'));
+            }
         }
 
-        // Assigned agent filter is only offered to admins.
         if ($user->isAdmin() && $request->filled('assigned_to')) {
             if ($request->input('assigned_to') === 'unassigned') {
                 $query->whereNull('assigned_to');
             } else {
-                $query->where('assigned_to', $request->input('assigned_to'));
+                $query->where('assigned_to', (int) $request->input('assigned_to'));
             }
         }
 
@@ -95,48 +138,90 @@ class TicketController extends Controller
         if ($request->boolean('overdue')) {
             $query->overdue();
         }
-
-        // withQueryString(): keeps the filters in the pagination links.
-        $tickets = $query->latest()->paginate(self::PER_PAGE)->withQueryString();
-
-        return view('tickets.index', [
-            'tickets' => $tickets,
-            'categories' => Category::orderBy('name')->get(['id', 'name']), // include inactive for filtering old tickets
-            'agents' => $user->isAdmin() ? $this->agentList() : collect(),
-        ]);
     }
 
     // =========================================================================
     // Create
     // =========================================================================
 
-    public function create()
+    public function create(Request $request)
     {
         Gate::authorize('create', Ticket::class);
+
+        $user = $request->user();
 
         return view('tickets.create', [
             'categories' => Category::activeForDropdown(),
+            // Admin chooses a client; customers' client is fixed; agents create internal tickets.
+            'clients' => $user->isAdmin() ? Client::active()->orderBy('name')->get(['id', 'code', 'name']) : collect(),
+            'projects' => $this->selectableProjects($user, null),
+            // Idempotency key: a new random UUID every time the form is opened.
+            'requestToken' => old('request_token', (string) Str::uuid()),
         ]);
     }
 
-    public function store(Request $request)
+    public function store(StoreTicketRequest $request)
+    {
+        // StoreTicketRequest already authorized and validated the input.
+        $ticket = $this->ticketService->createTicket(
+            $request->safe()->except('attachments'),
+            $request->user(),
+            $request->file('attachments', [])
+        );
+
+        $message = $ticket->wasRecentlyCreated
+            ? "Ticket {$ticket->ticket_number} was created successfully."
+            : "This form was already submitted. Showing ticket {$ticket->ticket_number}.";
+
+        return redirect()->route('tickets.show', $ticket)->with('success', $message);
+    }
+
+    /**
+     * GET /tickets/project-options?client_id=5  (Fetch API, dependent dropdown)
+     * Returns the projects the CURRENT user may choose. This only fills the
+     * dropdown; TicketService re-validates the choice when the ticket is saved.
+     */
+    public function projectOptions(Request $request)
     {
         Gate::authorize('create', Ticket::class);
 
-        $validated = $request->validate([
-            'subject' => ['required', 'string', 'max:255'],
-            'description' => ['required', 'string', 'max:5000'],
-            // Checked against the database (not the cache): the category must exist AND be active.
-            'category_id' => ['required', 'integer', Rule::exists('categories', 'id')->where('is_active', true)],
-            'priority' => ['required', Rule::in(array_keys(Ticket::PRIORITIES))],
-        ], [
-            'category_id.exists' => 'Please choose an active category.',
+        $request->validate(['client_id' => ['nullable', 'integer']]);
+
+        $clientId = $request->filled('client_id') ? (int) $request->input('client_id') : null;
+        $projects = $this->selectableProjects($request->user(), $clientId);
+
+        return response()->json([
+            'projects' => $projects->map(fn (Project $project) => [
+                'id' => $project->id,
+                'label' => $project->displayName(),
+            ])->values(),
         ]);
+    }
 
-        $ticket = $this->ticketService->createTicket($validated, $request->user());
+    /**
+     * Active projects a user may select for a NEW ticket.
+     *   customer: projects of their own client organization (none if standalone)
+     *   agent:    projects they support
+     *   admin:    projects of the chosen client, or all active projects
+     */
+    private function selectableProjects(User $user, ?int $clientId)
+    {
+        $query = Project::active()->orderBy('code');
 
-        return redirect()->route('tickets.show', $ticket)
-            ->with('success', "Ticket {$ticket->ticket_number} was created successfully.");
+        if ($user->isCustomer()) {
+            if ($user->client_id === null) {
+                return collect();
+            }
+            $clientId = $user->client_id; // never the requested one
+        }
+
+        if ($user->isAgent()) {
+            $query->whereHas('agents', fn ($agentQuery) => $agentQuery->where('users.id', $user->id));
+        } elseif ($clientId !== null) {
+            $query->whereHas('clients', fn ($clientQuery) => $clientQuery->where('clients.id', $clientId));
+        }
+
+        return $query->get(['id', 'code', 'name']);
     }
 
     // =========================================================================
@@ -147,17 +232,25 @@ class TicketController extends Controller
     {
         Gate::authorize('view', $ticket);
 
-        // Eager load everything the page displays (one query per relationship).
-        $ticket->load(['category', 'creator', 'assignedAgent', 'comments.user', 'activities.user']);
+        $user = $request->user();
+
+        // Eager load what the page displays. Customers never receive internal notes
+        // or internal activities: they are filtered out in the SQL query itself.
+        $ticket->load([
+            'category', 'project', 'client', 'creator', 'assignedAgent',
+            'comments' => fn ($query) => $query->visibleTo($user)->with(['user', 'attachments']),
+            'activities' => fn ($query) => $query->visibleTo($user)->with('user'),
+            'attachments' => fn ($query) => $query->whereNull('ticket_comment_id'),
+        ]);
 
         return view('tickets.show', [
             'ticket' => $ticket,
-            'agents' => $request->user()->isAdmin() ? $this->agentList() : collect(),
+            'agents' => $user->isAdmin() ? $this->assignmentService->eligibleAgents($ticket) : collect(),
         ]);
     }
 
     // =========================================================================
-    // Edit (subject, description, category, priority - never status)
+    // Edit (subject, description, category, priority - never status or scope)
     // =========================================================================
 
     public function edit(Ticket $ticket)
@@ -174,7 +267,7 @@ class TicketController extends Controller
         }
 
         return view('tickets.edit', [
-            'ticket' => $ticket,
+            'ticket' => $ticket->load(['project', 'client']),
             'categories' => $categories,
         ]);
     }
@@ -188,6 +281,7 @@ class TicketController extends Controller
             'description' => ['required', 'string', 'max:5000'],
             'category_id' => ['required', 'integer', 'exists:categories,id'],
             'priority' => ['required', Rule::in(array_keys(Ticket::PRIORITIES))],
+            'version' => ['required', 'integer'], // optimistic locking
         ]);
 
         // A NEW category must be active. Keeping the current (possibly inactive) one is allowed.
@@ -199,7 +293,10 @@ class TicketController extends Controller
             }
         }
 
-        $changed = $this->ticketService->updateTicket($ticket, $validated, $request->user());
+        $expectedVersion = (int) $validated['version'];
+        unset($validated['version']);
+
+        $changed = $this->ticketService->updateTicket($ticket, $validated, $expectedVersion, $request->user());
 
         $message = $changed ? 'Ticket updated successfully.' : 'No changes were made.';
 
@@ -216,11 +313,12 @@ class TicketController extends Controller
 
         $validated = $request->validate([
             'agent_id' => ['required', 'integer', 'exists:users,id'],
+            'version' => ['nullable', 'integer'],
         ]);
 
         $agent = User::findOrFail($validated['agent_id']);
 
-        $changed = $this->ticketService->assignAgent($ticket, $agent, $request->user());
+        $changed = $this->assignmentService->assignAgent($ticket, $agent, $request->user(), $this->expectedVersion($request));
 
         if (! $changed) {
             return back()->with('info', "The ticket is already assigned to {$agent->name}. Nothing was changed.");
@@ -232,11 +330,14 @@ class TicketController extends Controller
     public function autoAssign(Request $request, Ticket $ticket)
     {
         Gate::authorize('assign', $ticket);
+        $request->validate(['version' => ['nullable', 'integer']]);
 
-        $agent = $this->ticketService->autoAssign($ticket, $request->user());
+        $agent = $this->assignmentService->autoAssign($ticket, $request->user(), $this->expectedVersion($request));
 
         if ($agent === null) {
-            return back()->with('error', 'No active support agent is available. The ticket remains Open.');
+            $scope = $ticket->project_id === null ? 'active support agent' : 'active support agent for this project';
+
+            return back()->with('error', "No eligible {$scope} is available. The ticket remains Open.");
         }
 
         return back()->with('success', "Ticket automatically assigned to {$agent->name} (lowest current workload).");
@@ -249,8 +350,9 @@ class TicketController extends Controller
     public function start(Request $request, Ticket $ticket)
     {
         Gate::authorize('start', $ticket);
+        $request->validate(['version' => ['nullable', 'integer']]);
 
-        $this->ticketService->startWork($ticket, $request->user());
+        $this->ticketService->startWork($ticket, $request->user(), $this->expectedVersion($request));
 
         return back()->with('success', 'Ticket is now In Progress.');
     }
@@ -261,9 +363,10 @@ class TicketController extends Controller
 
         $validated = $request->validate([
             'resolution_note' => ['required', 'string', 'max:5000'],
+            'version' => ['nullable', 'integer'],
         ]);
 
-        $this->ticketService->resolve($ticket, $validated['resolution_note'], $request->user());
+        $this->ticketService->resolve($ticket, $validated['resolution_note'], $request->user(), $this->expectedVersion($request));
 
         return back()->with('success', 'Ticket marked as Resolved.');
     }
@@ -271,8 +374,9 @@ class TicketController extends Controller
     public function reopen(Request $request, Ticket $ticket)
     {
         Gate::authorize('reopen', $ticket);
+        $request->validate(['version' => ['nullable', 'integer']]);
 
-        $this->ticketService->reopen($ticket, $request->user());
+        $this->ticketService->reopen($ticket, $request->user(), $this->expectedVersion($request));
 
         return back()->with('success', 'Ticket reopened and moved back to In Progress.');
     }
@@ -280,23 +384,27 @@ class TicketController extends Controller
     public function close(Request $request, Ticket $ticket)
     {
         Gate::authorize('close', $ticket);
+        $request->validate(['version' => ['nullable', 'integer']]);
 
-        $this->ticketService->close($ticket, $request->user());
+        $this->ticketService->close($ticket, $request->user(), $this->expectedVersion($request));
 
         return back()->with('success', 'Ticket closed. Thank you for confirming the resolution.');
     }
 
     // =========================================================================
 
-    /** Active agents with their current workload, for dropdowns and filters. */
-    private function agentList()
+    /** The hidden "version" field of the form, or null when it was not sent. */
+    private function expectedVersion(Request $request): ?int
+    {
+        return $request->filled('version') ? (int) $request->input('version') : null;
+    }
+
+    /** Active agents (for the admin list filter). */
+    private function activeAgents()
     {
         return User::where('role', User::ROLE_AGENT)
             ->where('is_active', true)
-            ->withCount(['assignedTickets as workload_count' => function ($query) {
-                $query->whereIn('status', Ticket::WORKLOAD_STATUSES);
-            }])
             ->orderBy('name')
-            ->get();
+            ->get(['id', 'name']);
     }
 }

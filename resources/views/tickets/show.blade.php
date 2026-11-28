@@ -10,7 +10,11 @@
 @section('content')
 <div class="page-header">
     <div class="min-w-0">
-        <div class="text-muted small fw-semibold">{{ $ticket->ticket_number }}</div>
+        <div class="text-muted small fw-semibold">
+            {{ $ticket->ticket_number }} ·
+            {{ $ticket->project ? $ticket->project->code : 'Global' }}
+            @if ($ticket->client) · {{ $ticket->client->code }} @endif
+        </div>
         <h1 class="page-title text-break">{{ $ticket->subject }}</h1>
         <div class="mt-2 d-flex flex-wrap gap-1">@include('partials.ticket-badges', ['ticket' => $ticket])</div>
     </div>
@@ -27,6 +31,7 @@
             <div class="card-body">
                 {{-- {{ }} escapes HTML (XSS protection). CSS keeps the line breaks. --}}
                 <div class="text-prewrap">{{ $ticket->description }}</div>
+                @include('tickets._attachments', ['attachments' => $ticket->attachments])
             </div>
         </div>
 
@@ -42,25 +47,29 @@
             </div>
         @endif
 
-        {{-- Conversation --}}
+        {{-- Conversation. For customers the controller already removed internal notes in SQL. --}}
         <div class="card mb-4" id="conversation">
             <div class="card-header d-flex justify-content-between">
                 <span><i class="bi bi-chat-left-text me-1"></i> Conversation</span>
-                <span class="text-muted small">{{ $ticket->comments->count() }} comment(s)</span>
+                <span class="text-muted small">{{ $ticket->comments->count() }} message(s)</span>
             </div>
             <div class="card-body">
                 @forelse ($ticket->comments as $comment)
-                    <div class="comment">
+                    <div class="comment {{ $comment->isInternal() ? 'comment-internal' : '' }}">
                         <span class="avatar">{{ strtoupper(substr($comment->user->name, 0, 1)) }}</span>
                         <div class="comment-body">
                             <div class="d-flex flex-wrap justify-content-between gap-2 mb-1">
                                 <div>
                                     <span class="fw-semibold">{{ $comment->user->name }}</span>
                                     <span class="badge text-bg-light border ms-1">{{ $comment->user->roleLabel() }}</span>
+                                    @if ($comment->isInternal())
+                                        <span class="badge bg-warning-subtle text-warning-emphasis ms-1"><i class="bi bi-eye-slash"></i> Internal note</span>
+                                    @endif
                                 </div>
                                 <span class="small text-muted">{{ $comment->created_at->format('d M Y, h:i A') }}</span>
                             </div>
                             <div class="text-prewrap">{{ $comment->message }}</div>
+                            @include('tickets._attachments', ['attachments' => $comment->attachments])
                         </div>
                     </div>
                 @empty
@@ -70,16 +79,31 @@
 
             <div class="card-footer bg-white">
                 @can('comment', $ticket)
-                    <form method="POST" action="{{ route('tickets.comments.store', $ticket) }}">
+                    <form method="POST" action="{{ route('tickets.comments.store', $ticket) }}" enctype="multipart/form-data" data-disable-on-submit>
                         @csrf
-                        <label for="message" class="form-label required">Add a comment</label>
+                        <label for="message" class="form-label required">Add a message</label>
                         <textarea id="message" name="message" rows="3" class="form-control @error('message') is-invalid @enderror"
                                   placeholder="Write a reply..." required>{{ old('message') }}</textarea>
                         @error('message')
                             <div class="invalid-feedback">{{ $message }}</div>
                         @enderror
-                        <div class="mt-2 text-end">
-                            <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-send me-1"></i> Post Comment</button>
+
+                        <div class="row g-2 mt-1 align-items-end">
+                            @can('addInternalNote', $ticket)
+                                <div class="col-md-5">
+                                    <label for="visibility" class="form-label small mb-1">Visibility</label>
+                                    <select id="visibility" name="visibility" class="form-select form-select-sm">
+                                        <option value="public" @selected(old('visibility') !== 'internal')>Public reply (customer can see)</option>
+                                        <option value="internal" @selected(old('visibility') === 'internal')>Internal note (staff only)</option>
+                                    </select>
+                                </div>
+                            @endcan
+                            <div class="col-md">
+                                @include('tickets._attachment-input')
+                            </div>
+                            <div class="col-md-auto text-end">
+                                <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-send me-1"></i> Post</button>
+                            </div>
                         </div>
                     </form>
                 @else
@@ -88,7 +112,7 @@
             </div>
         </div>
 
-        {{-- Activity timeline --}}
+        {{-- Activity timeline (internal entries are filtered out for customers) --}}
         <div class="card">
             <div class="card-header"><i class="bi bi-clock-history me-1"></i> Activity History</div>
             <div class="card-body">
@@ -96,8 +120,15 @@
                     @foreach ($ticket->activities as $activity)
                         <li class="timeline-item">
                             <div>
-                                <span class="fw-semibold">{{ $activity->user->name }}</span>
+                                @if ($activity->isSystem())
+                                    <span class="fw-semibold"><i class="bi bi-cpu"></i> System</span>
+                                @else
+                                    <span class="fw-semibold">{{ $activity->user->name }}</span>
+                                @endif
                                 <span class="text-muted">{{ strtolower($activity->actionLabel()) }}</span>
+                                @if ($activity->is_internal)
+                                    <span class="badge bg-warning-subtle text-warning-emphasis">internal</span>
+                                @endif
                             </div>
                             @if ($activity->old_value !== null || $activity->new_value !== null)
                                 <div class="small text-prewrap">
@@ -119,7 +150,8 @@
     {{-- ================= Side panel ================= --}}
     <div class="col-lg-4">
         {{-- Workflow actions: @can() uses TicketPolicy, so invalid actions are not shown.
-             The controller checks the SAME policy again, so hidden buttons cannot be forced. --}}
+             The controller checks the SAME policy again, so hidden buttons cannot be forced.
+             Every form sends the ticket "version" the user is looking at (optimistic locking). --}}
         @php($hasActions = auth()->user()->can('assign', $ticket) || auth()->user()->can('start', $ticket) || auth()->user()->can('resolve', $ticket) || auth()->user()->can('reopen', $ticket) || auth()->user()->can('close', $ticket))
 
         @if ($hasActions)
@@ -128,9 +160,10 @@
                 <div class="card-body d-grid gap-3">
 
                     @can('assign', $ticket)
-                        <form method="POST" action="{{ route('tickets.assign', $ticket) }}"
+                        <form method="POST" action="{{ route('tickets.assign', $ticket) }}" data-disable-on-submit
                               data-confirm="{{ $ticket->assigned_to ? 'Reassign this ticket to the selected agent?' : 'Assign this ticket to the selected agent?' }}">
                             @csrf
+                            <input type="hidden" name="version" value="{{ $ticket->version }}">
                             <label for="agent_id" class="form-label small fw-semibold">
                                 {{ $ticket->assigned_to ? 'Reassign Agent' : 'Assign Agent' }}
                             </label>
@@ -145,28 +178,35 @@
                                 </select>
                                 <button type="submit" class="btn btn-primary">{{ $ticket->assigned_to ? 'Reassign' : 'Assign' }}</button>
                             </div>
+                            <div class="form-text">
+                                {{ $ticket->project ? 'Only active agents of ' . $ticket->project->code . ' are listed.' : 'Global ticket: every active agent is eligible.' }}
+                            </div>
+                            @error('agent_id')<div class="text-danger small">{{ $message }}</div>@enderror
                         </form>
 
                         @if ($ticket->status === \App\Models\Ticket::STATUS_OPEN)
-                            <form method="POST" action="{{ route('tickets.auto-assign', $ticket) }}"
-                                  data-confirm="Automatically assign this ticket to the agent with the lowest workload?">
+                            <form method="POST" action="{{ route('tickets.auto-assign', $ticket) }}" data-disable-on-submit
+                                  data-confirm="Automatically assign this ticket to the eligible agent with the lowest workload?">
                                 @csrf
+                                <input type="hidden" name="version" value="{{ $ticket->version }}">
                                 <button type="submit" class="btn btn-outline-primary w-100"><i class="bi bi-shuffle me-1"></i> Auto Assign</button>
-                                <div class="form-text">Picks the active agent with the fewest Assigned/In Progress tickets.</div>
+                                <div class="form-text">Picks the eligible agent with the fewest Assigned/In Progress tickets.</div>
                             </form>
                         @endif
                     @endcan
 
                     @can('start', $ticket)
-                        <form method="POST" action="{{ route('tickets.start', $ticket) }}" data-confirm="Start working on this ticket?">
+                        <form method="POST" action="{{ route('tickets.start', $ticket) }}" data-confirm="Start working on this ticket?" data-disable-on-submit>
                             @csrf
+                            <input type="hidden" name="version" value="{{ $ticket->version }}">
                             <button type="submit" class="btn btn-primary w-100"><i class="bi bi-play-circle me-1"></i> Start Working</button>
                         </form>
                     @endcan
 
                     @can('resolve', $ticket)
-                        <form method="POST" action="{{ route('tickets.resolve', $ticket) }}" data-confirm="Mark this ticket as resolved?">
+                        <form method="POST" action="{{ route('tickets.resolve', $ticket) }}" data-confirm="Mark this ticket as resolved?" data-disable-on-submit>
                             @csrf
+                            <input type="hidden" name="version" value="{{ $ticket->version }}">
                             <label for="resolution_note" class="form-label small fw-semibold required">Resolution note</label>
                             <textarea id="resolution_note" name="resolution_note" rows="3"
                                       class="form-control mb-2 @error('resolution_note') is-invalid @enderror"
@@ -179,15 +219,19 @@
                     @endcan
 
                     @can('close', $ticket)
-                        <form method="POST" action="{{ route('tickets.close', $ticket) }}" data-confirm="Confirm the resolution and close this ticket? Closed tickets cannot be changed.">
+                        <form method="POST" action="{{ route('tickets.close', $ticket) }}" data-disable-on-submit
+                              data-confirm="Confirm the resolution and close this ticket? Closed tickets cannot be changed.">
                             @csrf
+                            <input type="hidden" name="version" value="{{ $ticket->version }}">
                             <button type="submit" class="btn btn-success w-100"><i class="bi bi-lock me-1"></i> Confirm &amp; Close Ticket</button>
                         </form>
                     @endcan
 
                     @can('reopen', $ticket)
-                        <form method="POST" action="{{ route('tickets.reopen', $ticket) }}" data-confirm="Reopen this ticket? It will go back to In Progress.">
+                        <form method="POST" action="{{ route('tickets.reopen', $ticket) }}" data-disable-on-submit
+                              data-confirm="Reopen this ticket? It will go back to In Progress.">
                             @csrf
+                            <input type="hidden" name="version" value="{{ $ticket->version }}">
                             <button type="submit" class="btn btn-outline-danger w-100"><i class="bi bi-arrow-counterclockwise me-1"></i> Reopen Ticket</button>
                         </form>
                     @endcan
@@ -201,6 +245,19 @@
                 <dl class="detail-list mb-0">
                     <dt>Ticket number</dt>
                     <dd class="fw-semibold">{{ $ticket->ticket_number }}</dd>
+
+                    <dt>Project</dt>
+                    <dd>
+                        @if ($ticket->project)
+                            {{ $ticket->project->displayName() }}
+                            @unless ($ticket->project->is_active)<span class="badge text-bg-light border">Inactive</span>@endunless
+                        @else
+                            <span class="text-muted">Global (no specific project)</span>
+                        @endif
+                    </dd>
+
+                    <dt>Client</dt>
+                    <dd>{{ $ticket->client?->displayName() ?? 'Internal (no client)' }}</dd>
 
                     <dt>Category</dt>
                     <dd>
@@ -228,7 +285,11 @@
                         @if ($ticket->isOverdue())
                             <div><span class="badge badge-overdue mt-1"><i class="bi bi-alarm"></i> Overdue by {{ $ticket->due_at->diffForHumans(null, true) }}</span></div>
                         @elseif (in_array($ticket->status, \App\Models\Ticket::ACTIVE_STATUSES, true))
-                            <div class="small text-muted">{{ $ticket->due_at->diffForHumans() }}</div>
+                            <div class="small text-muted">Remaining: {{ $ticket->slaRemainingForHumans() }}</div>
+                        @elseif ($ticket->resolvedWithinSla() === true)
+                            <div><span class="badge bg-success-subtle text-success-emphasis mt-1">Resolved within SLA</span></div>
+                        @elseif ($ticket->resolvedWithinSla() === false)
+                            <div><span class="badge bg-danger-subtle text-danger-emphasis mt-1">Resolved after SLA</span></div>
                         @endif
                     </dd>
 
@@ -236,7 +297,10 @@
                     <dd>{{ $ticket->created_at->format('d M Y, h:i A') }}</dd>
 
                     <dt>Resolved</dt>
-                    <dd class="mb-0">{{ $ticket->resolved_at ? $ticket->resolved_at->format('d M Y, h:i A') : '—' }}</dd>
+                    <dd>{{ $ticket->resolved_at ? $ticket->resolved_at->format('d M Y, h:i A') : '—' }}</dd>
+
+                    <dt>Version</dt>
+                    <dd class="mb-0 small text-muted" title="Optimistic locking counter: increases with every change">v{{ $ticket->version }}</dd>
                 </dl>
             </div>
         </div>

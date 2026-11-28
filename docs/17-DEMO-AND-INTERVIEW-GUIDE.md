@@ -1,8 +1,13 @@
-# 17 — Demo and Interview Guide
+# 17 — Demo and Interview Guide (V2)
 
-This guide prepares you to **show** ResolveDesk in 5 minutes, **explain** it in 10 minutes, and **answer
+This guide prepares you to **show** ResolveDesk V2 in 5 minutes, **explain** it in 10 minutes, and **answer
 follow-up questions** honestly. Everything described as a feature is implemented and was verified as listed in
 `DEVELOPMENT_PROGRESS.md`. Things that are only ideas are clearly marked *future*.
+
+Related: [01 overview](01-PROJECT-OVERVIEW.md) · [10 system design](10-SYSTEM-DESIGN-GUIDE.md) ·
+[20 concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md) · [21 real-time](21-REALTIME-REVERB-ECHO.md) ·
+[22 V2 features](22-V2-BUSINESS-FEATURES.md) · [23 security/ops](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md) ·
+[18 deployment](18-PRODUCTION-DEPLOYMENT.md) · [19 backup](19-BACKUP-AND-RECOVERY.md)
 
 ---
 
@@ -10,183 +15,167 @@ follow-up questions** honestly. Everything described as a feature is implemented
 
 Say this (in your own words) at the start, or when asked "did you build this yourself?":
 
-> "I built ResolveDesk with AI assistance — I used Claude Code to generate and review much of the code, based on a
-> detailed specification I wrote. My goal was not just a working app but one I fully understand. I read every
-> file, I wrote learning notes, I ran the test suite and a manual HTTP smoke test, and I can explain and modify any
-> part of it. I deliberately kept it as plain Laravel MVC with one service class so that I can change it live."
+> "I built ResolveDesk with AI assistance — I used Claude Code to generate and review much of the code from a
+> detailed specification I wrote, first for V1 and then for the V2 multi-project upgrade. My goal was an application
+> I fully understand, not just one that runs. I read the code, kept learning notes, ran the 164-test suite, and ran
+> extra checks such as parallel PHP processes for the locks and a real WebSocket client for Reverb. I deliberately
+> kept it plain Laravel MVC with a few service classes so that I can change it live. Some things were not verified —
+> for example a real browser test, real SMTP and a Linux deployment — and I'll say so when they come up."
 
-Why this is the right approach:
+Why this matters:
 
-- Interviewers often ask; a dishonest answer is discovered quickly by one deep question.
-- The value you show is **understanding**: the business rules, the trade-offs, the debugging, the ability to
-  modify code. That is what the rest of this guide trains.
-- Do not claim things that were not verified. Not verified: browser rendering by automation, the toast in a real
-  browser by automation, Gmail SMTP delivery. (Check the toast yourself before the interview — see §1.)
+- Interviewers often ask; one deep question exposes a dishonest answer.
+- Your value is **understanding**: business rules, trade-offs, debugging, modifying code.
+- **Not verified** (never claim otherwise): visual rendering and the toast inside a real browser (the real-time path
+  was verified with a Node + pusher-js client, 255 ms), Gmail SMTP, MySQL 8 (only MariaDB 10.4), Linux/Nginx/Supervisor
+  deployment, a backup restore drill. Rehearse the browser toast yourself before the interview (§1).
 
 ---
 
-## 1. Preparation before the demo (10 minutes, the day before)
+## 1. Preparation (the day before, ~15 minutes)
+
+**Do not run `migrate:fresh` on the development database** — it contains data that must be preserved.
+The demo below works on the existing dev DB after `php artisan db:seed --class=V2DemoDataSeeder` (additive), because
+it creates its own new ticket. If you want a clean demo database, create a separate one (e.g. `resolvedesk_demo`),
+point `.env` at it temporarily, then `migrate --seed` there.
+
+Four terminals, each with PHP 8.4 on PATH (`export PATH="/c/php-8.4.28:$PATH"`):
 
 ```bash
-# Git Bash
-export PATH="/c/php-8.4.28:$PATH"
-php -v                                  # must be 8.4.28
-# Start MariaDB: XAMPP Control Panel -> MySQL -> Start
-php artisan migrate:fresh --seed        # WARNING: deletes ALL local data and recreates demo data (local only!)
-php artisan serve                       # http://127.0.0.1:8000
+php artisan serve           # 1: http://127.0.0.1:8000
+php artisan queue:work      # 2: emails (log mailer)
+php artisan reverb:start    # 3: WebSockets :8080 (add --debug to watch messages)
+php artisan schedule:work   # 4: SLA check every minute
 ```
 
-Why re-seed? The demo below uses ticket numbers from a **fresh** seed (TK-000001 … TK-000032). The local
-development database was already changed by the smoke test (e.g. TK-000001 is no longer Open), so without a
-fresh seed the numbers differ — then simply pick any Open ticket.
+Also: MariaDB running (XAMPP), `npm run build` done once (so `public/build/manifest.json` exists),
+`php artisan test` green.
 
-Open **three separate browser sessions** (sessions are cookies, so they must not share cookies):
+Browser sessions (must not share cookies):
 
 | Window | Browser | Log in as (password `password`) |
 |---|---|---|
-| A | Chrome normal window | `admin@resolvedesk.test` (Nadia Rahman, admin) |
-| B | Chrome Incognito window | `michael.agent@resolvedesk.test` (Michael Brown, agent) |
-| C | Edge / Firefox | `john.customer@example.com` (John Carter, customer) |
+| A | Chrome normal | `admin@resolvedesk.test` |
+| A2 | second tab in the same Chrome window | admin, used for the stale-version demo |
+| B | Chrome Incognito (or Edge) | `sarah.agent@resolvedesk.test` (supports HRMS + PAYROLL in the demo data) |
 
-Optional second terminal for email: do **not** start a worker yet (you will show the pending job).
-
-Rehearse once. Check that the toast actually appears in window B (this was not verified by automation).
+Prepare a small PDF or PNG (< 5 MB) to attach. Rehearse once and confirm the toast appears in window B.
 
 ---
 
-## 2. Five-minute demo script (click by click)
-
-Seed facts used below (fresh seed): 32 tickets — 6 Open, 6 Assigned, 7 In Progress, 5 Resolved, 8 Closed.
-TK-000001 "Invoice #INV-2291 shows the wrong VAT amount" is an Open, Medium ticket created by **John Carter**.
-The least-busy active agent is **Michael Brown** (workload 2).
+## 2. Five-minute V2 demo (two browsers, real-time toast)
 
 | Time | Window | Click / action | What you say |
 |---|---|---|---|
-| 0:00 | A | Dashboard is open | "This is the admin dashboard. The status cards and three charts come from aggregate SQL and are cached for 60 seconds — see *Statistics generated at*. The Overdue card and the agent workload table are **live**, never cached, because overdue depends on the current time." |
-| 0:40 | A | Click the red **Overdue** card (opens `/tickets?overdue=1`) | "Overdue = still active and `due_at` has passed. SLA is 48/24/8/2 hours for Low/Medium/High/Critical. Here TK-000004, a Critical API outage, had a 2-hour SLA and is already late." Point to the red rows and *Overdue* badges. |
-| 1:10 | A | Clear the filter, open **TK-000001** | "Customer John reported a VAT problem. Status Open, unassigned. On the right: the workflow panel. Buttons appear only if `TicketPolicy` allows them — and the controller checks the same policy again." |
-| 1:30 | A | Click **Auto Assign** | "Auto assign picks the active agent with the fewest Assigned + In Progress tickets, tie-break by lowest id. It runs in a transaction with a `SELECT … FOR UPDATE` row lock." Flash: *Ticket automatically assigned to Michael Brown (lowest current workload).* Show the new activity rows in the timeline (assigned, status Open → Assigned). |
-| 2:00 | B | Do nothing — wait ≤ 5 s | A toast appears: **TK-000001 · New ticket assigned**, and the bell badge increases. "No refresh. The browser polls `/notifications/feed` every 5 seconds with `fetch`; the toast is de-duplicated by notification id. It's near-real-time, not push." |
-| 2:30 | B | Click the toast | "Clicking marks it read with an AJAX POST that sends the CSRF token, then opens the ticket — and the ticket page checks permission again." |
-| 2:45 | B | Click **Start Working** → confirm | Status Assigned → In Progress. "Transitions come from one table, `Ticket::TRANSITIONS`. Any other change is rejected." |
-| 3:05 | B | Type a resolution note, click **Resolve Ticket** → confirm | "A resolution note is required; `resolved_at` is set; the creator gets an in-app notification and a queued email." |
-| 3:30 | C | Wait ≤ 5 s | Toast **TK-000001 · Ticket resolved** for John. Open it. |
-| 3:45 | C | Click **Reopen Ticket** → confirm (or **Confirm & Close Ticket**) | Reopen: back to In Progress, Michael gets a toast in window B (*Ticket reopened*). Close: status Closed, the ticket becomes read-only (comment form disappears). "Only the creator or an admin may close or reopen, and only from Resolved." |
-| 4:15 | A | Refresh the dashboard | "*Statistics generated at* changed: every workflow action calls `Cache::forget('dashboard:admin:stats')` after commit." |
-| 4:30 | terminal | `php artisan queue:work --stop-when-empty`, then show the end of `storage/logs/laravel.log` | "Emails are queued jobs in the `jobs` table. With no worker, they just wait; the ticket workflow is unaffected. The worker processed them; locally the `log` mailer writes the email to the log instead of SMTP." |
-| 5:00 | — | Stop | "That's the full lifecycle: create, assign, work, resolve, confirm — with SLA, audit history, notifications, queue and cache." |
+| 0:00 | A | Admin dashboard | "V2 supports several products and client companies. These cards show tickets per **project** and per **client**, global vs project tickets, and SLA compliance. Aggregates are cached 60 s; the overdue count and workload table are live." |
+| 0:30 | A | **Projects** → open **HRMS** | "Each project has client organizations and support agents — two many-to-many pivot tables. Removing an agent who still has unresolved or reopenable (Resolved) HRMS tickets is refused; the project row is locked while checking." |
+| 0:55 | A | **New Ticket**: client **ACME**, project **HRMS** (dropdown refreshes via `/tickets/project-options`), priority High, attach the PDF → **Create** | "The project list depends on the client, but that's only UX — `TicketService::resolveScope()` re-checks on the server. The form carries a hidden `request_token`: a double click returns the same ticket instead of creating two. The file goes to a private disk with a UUID name." |
+| 1:40 | A2 | Open the new ticket → **Edit** (leave the form open, don't save) | "I'll come back to this tab to show optimistic locking." |
+| 1:50 | A | On the ticket page, **Assign** → Sarah | "Assignment takes a global `Cache::lock`, then a shared lock on the project row, then `SELECT … FOR UPDATE` on the ticket. Only agents of HRMS are in the list, and the server re-checks eligibility." |
+| 2:05 | B | (no click) | A toast appears **immediately**: *New ticket assigned*. "That came over a WebSocket. After the database commit, Laravel broadcasts a tiny event — only the notification id — to Reverb on the private channel `users.{Sarah's id}`. The browser then fetches the full notification from the normal authorized JSON feed." |
+| 2:30 | B | Open the ticket, add an **internal note** "Checked logs, HRMS leave module", then **Start Working** | "Internal notes are staff-only: a customer never receives them — they are filtered in SQL, not just hidden. Every change increases the ticket's `version`." |
+| 3:00 | A2 | Change the subject and **Save** | Error: *This ticket was changed by someone else after you opened the page…* "This is optimistic locking: `UPDATE … WHERE id = ? AND version = ?` updated 0 rows, so we reject instead of silently overwriting Sarah's change. For a JSON request it's HTTP 409." |
+| 3:30 | terminal 3 | `Ctrl+C` (stop Reverb) | "Now the WebSocket server is down." |
+| 3:35 | B | Type a resolution note → **Resolve Ticket** | "The request still succeeds — broadcast errors are caught and logged." |
+| 3:45 | A | Wait ≤ 5 s | Toast *Ticket resolved* (admin created the ticket). "Delivered by the polling fallback. The database notification is the source of truth; real-time is an optimization. That's graceful degradation." Restart Reverb. |
+| 4:10 | A | **Reports** → filter project HRMS → **Export CSV** | "Reports use the same filters; export is streamed in chunks of 500 and protected against CSV formula injection, and rate limited to 5 per minute." |
+| 4:35 | terminal | `php artisan schedule:list` | "The scheduler runs `tickets:check-sla` every minute without overlapping; each breach is notified exactly once because the check and the `sla_notified_at` update happen on a locked row." |
+| 5:00 | — | Stop | "So: multi-project scope, data isolation, concurrency control, real-time with fallback, secure files, SLA automation and reports — all plain Laravel." |
 
-**If something goes wrong live:** no toast → open the bell dropdown (the list is still updated) or wait for the
-next poll; check DevTools → Network for `/notifications/feed`. Auto Assign says no agent available → an agent was
-deactivated; use manual **Assign** instead.
+**If something goes wrong live:** no toast in B → check terminal 3 and DevTools → Network → WS; the bell still updates
+by polling within 5 s. Sarah missing from the assign list → she is not an HRMS agent in this DB; pick an agent who is
+(project page) or use a global ticket. "Another assignment is being processed" → wait a second and retry (lock
+timeout is 5 s).
+
+> **বাংলায়:** ডেমোর মূল তিনটি মুহূর্ত: (১) অন্য ব্রাউজারে সাথে সাথে toast আসা — WebSocket; (২) পুরনো এডিট ফর্ম সেভ
+> করলে রিজেক্ট হওয়া — optimistic locking; (৩) Reverb বন্ধ করলেও কাজ চলা আর polling দিয়ে নোটিফিকেশন আসা —
+> graceful degradation। এই তিনটা পরিষ্কারভাবে দেখাতে পারলে V2-এর মূল কাজ বোঝানো হয়ে যায়।
 
 ---
 
 ## 3. Ten-minute technical explanation
 
-Use this structure (≈1 minute per point). Each point names the file to open if they want to see code.
+About one minute per point; name the file to open if they want code.
 
-1. **Problem and roles (1 min).** Support requests get lost without a central system. Three roles in one `role`
-   column: admin, agent, customer. Accounts are deactivated, never deleted. (`app/Models/User.php`)
-2. **Architecture (1 min).** Classic Laravel MVC monolith, Blade + Bootstrap + vanilla JS, MySQL-compatible DB.
-   Controllers stay thin; one `TicketService` holds the coordinated ticket rules; plain CRUD (users, categories)
-   stays in controllers. (`app/Services/TicketService.php`)
-3. **Request pipeline and security (1 min).** Route → middleware `auth`, `active` (logs out deactivated users even
-   mid-session), `role:admin` → controller → `Gate::authorize()` with `TicketPolicy` → validation → service. CSRF on
-   every POST, `{{ }}` escaping, `$fillable`, login rate limiting, session regeneration.
-4. **Data model (1 min).** `users`, `categories`, `tickets` (two FKs to users: `created_by`, nullable
-   `assigned_to`), `ticket_comments`, `ticket_activities`, plus Laravel's `notifications`, `jobs`, `failed_jobs`,
-   `cache`, `sessions`. Indexes on status, priority, due_at, created_at and `(assigned_to, status)`.
-5. **Workflow as a state machine (1 min).** `Ticket::TRANSITIONS` keyed by action; assignment does Open → Assigned;
-   the edit form never changes status. Business-rule failures throw `ValidationException` → redirect back with
-   a message.
-6. **Concurrency (1 min).** Every workflow method: `DB::transaction()` + `lockForUpdate()` + re-check the rule on the
-   locked row. Two admins auto-assigning the same ticket: the second waits, then sees it is no longer Open.
-7. **SLA (0.5 min).** `due_at = created_at + SLA_HOURS[priority]`; recalculated from original `created_at` on
-   priority change; overdue computed live by a scope. `due_at` is DATETIME because of a real MariaDB TIMESTAMP bug I
-   found during seeding.
-8. **Notifications (1 min).** One `TicketNotification` (database channel, not queued, inside the transaction).
-   Recipient rules in `notifyUser()`: skip null, inactive, and the actor. A new ticket notifies (and emails) every
-   active admin — an owner-requested addition to the original matrix. Polling with recursive `setTimeout`,
-   `?since=server_time`, `Set` of shown ids, `textContent` against XSS, slower polling in hidden tabs.
-9. **Queue and email (1 min).** `SendTicketEmail` (`ShouldQueue`, 3 tries, 10 s backoff, `failed()` logs) dispatched
-   inside `DB::afterCommit()` with try/catch: rollback → no email; email failure → never undoes the ticket change.
-10. **Cache and dashboard (0.5 min).** Cache-aside with `Cache::remember()` for admin aggregates (60 s) and the
-    active category dropdown (1 h), `Cache::forget()` after commits. Never cached: overdue, workload, permissions,
-    unread counts. Validation always checks the database.
-11. **Quality (1 min).** 85 feature tests (`tests/Feature`) on a separate `resolvedesk_testing` database,
-    `Model::preventLazyLoading()` outside production to catch N+1, and a manual curl smoke test with separate
-    sessions per role.
+1. **Problem and domain (1 min).** Software company, many products and client companies. Four ticket kinds from
+   nullable `project_id` / `client_id`; "global" ≠ public. (`TicketService::resolveScope()`)
+2. **Architecture (1 min).** Laravel modular monolith, MVC, Blade + Bootstrap + vanilla JS. Thin controllers; five
+   focused services (`TicketService`, `TicketAssignmentService`, `TicketNotifier`, `AttachmentService`,
+   `ProjectService`). Four processes: web, queue worker, Reverb, scheduler.
+3. **Security layers (1 min).** Middleware (`auth`, `active`, `role:admin`, `throttle:*`, `AddRequestContext`) →
+   `TicketPolicy` → service re-checks on locked rows → query scopes (`visibleTo`) → channel authorization in
+   `routes/channels.php`. CSRF, escaping, `$fillable`, private files.
+4. **Data model (1 min).** `projects`, `clients`, `client_project`, `project_user`, `users.client_id`, ticket columns
+   `project_id`, `client_id`, `version`, `request_token`, `sla_notified_at`, `ticket_attachments`. Additive
+   migrations; old tickets became global.
+5. **Concurrency (1.5 min).** Pessimistic `lockForUpdate` for transitions; optimistic `version` for edits (409);
+   `Cache::lock('ticket-assignment')` so parallel auto-assigns don't pick the same "least busy" agent; lock order
+   cache lock → project row → ticket row; `DB::transaction(fn, 3)` retries deadlocks. Verified with two-connection
+   tests and 4 parallel PHP processes.
+6. **Idempotency (0.5 min).** `request_token` + unique `(created_by, request_token)`; same content → replay, different
+   content → conflict. 6 parallel identical submits → 1 ticket.
+7. **Notifications and real-time (1.5 min).** `TicketNotifier::notify()` inserts the database notification inside
+   the transaction; after commit it broadcasts `UserNotificationCreated` (`ShouldBroadcastNow`, payload only the id)
+   and dispatches the email job. Echo listens on private `users.{id}`; `notifications.js` polls only when the socket
+   is unhealthy. Side effects are held until the assignment lock is released.
+8. **Queue and email (0.5 min).** `SendTicketEmail`: 3 tries, 10 s backoff, 60 s timeout (< `retry_after` 90),
+   delivery key in the cache to skip a resend after a retry.
+9. **Attachments (0.5 min).** Validation by extension + MIME, private disk, UUID names, files stored before the
+   transaction and deleted on failure, download through `TicketPolicy::downloadAttachment()` with `nosniff`.
+10. **SLA, reports, operations (1 min).** `tickets:check-sla` every minute with `chunkById` and per-row lock;
+    `/reports` + streamed CSV; rate limiters; `X-Request-Id` in logs; `/up` and `/health/ready`.
+11. **Quality (0.5 min).** 164 feature tests / 661 assertions on `resolvedesk_testing` (MariaDB 10.4), including
+    `MySqlConcurrencyTest` with two real connections; `preventLazyLoading` against N+1; Pint.
 
 ---
 
 ## 4. Business problem explanation
 
-"A software company receives support requests by phone, email and chat. Requests get lost, two engineers work on
-the same issue, some agents are overloaded, deadlines are missed, and managers cannot see what is happening.
-ResolveDesk gives one place for every request (a ticket), clear ownership (assignment), a controlled lifecycle
-(Open → Assigned → In Progress → Resolved → Closed, with Reopen), deadlines per priority (SLA), a conversation
-and a full audit trail, automatic notifications so nobody has to refresh, and a dashboard for managers."
-
-Key business rules to mention: customers see only their own tickets; agents see tickets they created or are
-assigned to; the **customer confirms** the resolution (Close) or rejects it (Reopen); closed tickets are read-only;
-a category in use cannot be deleted, only deactivated; an agent with unfinished tickets cannot be deactivated.
+"A company sells HRMS, ERP, Payroll and other products to many client companies. Requests come by phone, email and
+chat; they get lost, engineers duplicate work, an ERP issue goes to someone who doesn't know ERP, deadlines are
+missed and one client's data could leak to another. ResolveDesk groups every request by project and client, assigns
+it only to agents of that product (manually or by lowest workload), runs a controlled lifecycle with SLA deadlines
+and automatic breach reminders, keeps public replies and internal notes apart, stores files privately, notifies
+people instantly, and gives managers per-project and per-client reports."
 
 ## 5. Architecture explanation
 
 ```mermaid
 flowchart TD
-    B["Browser: Blade pages + notifications.js"] -->|"HTTP + session cookie + CSRF"| R["routes/web.php"]
-    R --> M["Middleware: auth, active, role"]
+    B["Browser: Blade + notifications.js + realtime.js"] -->|"HTTP, session, CSRF"| R["routes/web.php"]
+    R --> M["Middleware: auth, active, role, throttle, AddRequestContext"]
     M --> C["Controllers"]
-    C -->|"Gate::authorize"| P["TicketPolicy"]
-    C -->|"validate()"| C
-    C --> S["TicketService: transaction + row lock"]
-    C --> MD["Eloquent models (CRUD)"]
-    S --> MD
-    MD --> DB[("MariaDB / MySQL")]
-    S -->|"notify()"| N["notifications table"]
-    S -->|"DB::afterCommit dispatch"| J["jobs table"]
-    J --> W["queue:work -> SendTicketEmail -> TicketUpdateMail"]
-    C -->|"Cache::remember"| CA["cache table"]
-    S -->|"Cache::forget"| CA
+    C --> P["TicketPolicy"]
+    C --> S["Services: transactions + locks"]
+    S --> DB[("MariaDB/MySQL")]
+    S --> N["TicketNotifier"]
+    N -->|"after commit"| RV["Reverb"]
+    N -->|"after commit"| J["jobs table"]
+    RV -->|"private users.id"| B
+    J --> W["queue:work: SendTicketEmail"]
+    SC["schedule:run"] --> CMD["tickets:check-sla"] --> S
 ```
 
-Why a service class only for tickets? Ticket actions touch 4–5 things at once (ticket, activity, notification,
-email, cache) and must be atomic. Putting that in controllers would duplicate the pattern 8 times. Users and
-categories are simple CRUD, so a service would be an unnecessary abstraction.
+Why several services and not one? Each has one reason to change: ticket rules, assignment + locking, delivery of
+notifications, file storage, project associations. They are plain classes injected by the container — no
+interfaces or repositories, because there is only one implementation of each.
 
 ## 6. Database design explanation
 
-- `tickets.created_by` and `tickets.assigned_to` both reference `users.id` → two `belongsTo` relations
-  (`creator`, `assignedAgent`) with custom foreign keys.
-- All FKs use `restrictOnDelete()`: history must never disappear, so users and used categories are deactivated, not
-  deleted.
-- `ticket_number` = `TK-` + zero-padded id, set after insert in the same transaction (unique, nullable for that
-  short moment) — no `MAX(id)+1` race.
-- Status/priority/role are strings validated against model constants (simpler to change than DB enums).
-- `ticket_activities` stores `action`, `old_value`, `new_value` for the timeline.
-- `notifications` uses a polymorphic owner (`notifiable_type`, `notifiable_id`) and JSON `data`.
-- Composite index `(assigned_to, status)` supports the workload count for auto-assign and agent dashboards.
+- Two pivots with unique pairs and `restrictOnDelete()`; projects/clients are deactivated, never deleted.
+- `tickets.version` (default 1) for optimistic locking; `request_token` with a composite unique index for
+  idempotency; `sla_notified_at` to remember the reminder.
+- Indexes added for the new access paths: `(project_id, status)`, `(client_id, status)`, `(status, due_at)` for the
+  scheduler, and `(notifiable_type, notifiable_id, created_at)` for the feed (EXPLAIN: filesort removed).
+- `ticket_activities.user_id` became nullable so the scheduler can write **system** activities.
+- Attachment metadata in `ticket_attachments`; the file itself on the private disk.
 
-## 7. System design explanation (and how it would scale)
+## 7. System design and scaling (implemented vs future)
 
-Current: one web server, one database, database-backed sessions, cache and queue; one queue worker; polling every
-5 s. Suitable for a small/medium support team.
-
-If load grew (all *future*):
-
-| Bottleneck | Next step |
-|---|---|
-| Polling requests | Laravel Reverb / WebSockets (broadcast channel), or longer intervals |
-| DB used for cache, queue, sessions | Redis for cache, queue and sessions |
-| One worker | Several workers under Supervisor; separate queues (`emails`) |
-| Email lost if crash between commit and dispatch | Transactional outbox table |
-| Duplicate emails on retry | Idempotency key per email |
-| SLA escalation | Scheduler command (`schedule:run`) that notifies about overdue tickets |
-| Big ticket table | More indexes / read replica / archiving closed tickets |
-
-See [10-SYSTEM-DESIGN-GUIDE.md](10-SYSTEM-DESIGN-GUIDE.md).
+Implemented: one server, database-backed session/cache/queue/locks, one worker, one Reverb process, cron scheduler.
+*Future* (not implemented): Redis for cache/queue/locks/sessions, several app servers behind a load balancer, Reverb
+horizontal scaling through Redis pub/sub, S3 for attachments, read replica for reports, `onOneServer()` for the
+scheduler, central monitoring. See [10-SYSTEM-DESIGN-GUIDE.md](10-SYSTEM-DESIGN-GUIDE.md) Part E.
 
 ---
 
@@ -194,113 +183,113 @@ See [10-SYSTEM-DESIGN-GUIDE.md](10-SYSTEM-DESIGN-GUIDE.md).
 
 | Decision | Benefit | Cost |
 |---|---|---|
-| Polling instead of WebSockets | Simple, no extra server, works on XAMPP | Up to 5 s delay, many empty requests |
-| Database queue instead of Redis | No extra software | Slower, DB load |
-| Database cache | No extra software | Still a DB query per read |
-| `DB::afterCommit()` instead of outbox | Simple, prevents emails for rolled-back changes | Tiny window where a crash loses an email |
-| In-app notification not queued | Works without a worker, atomic with the change | Slightly longer transaction |
-| One `role` column, no permission package | Easy to read and explain | Not flexible for many custom roles |
-| String status + model constants instead of DB enum | Easy to add a status | DB does not enforce valid values (validation and code do) |
-| `ValidationException` for business-rule errors | Reuses Laravel's error display and 422 JSON | Not a "validation" error in the strict sense |
-| Reopen keeps original `due_at` | Simple rule | A reopened ticket may be instantly overdue |
-| Continuous-hours SLA | Simple | Ignores business hours and holidays |
-| MariaDB 10.4 instead of MySQL 8 | It was what was installed | Required DATETIME for `due_at`/`resolved_at` |
+| Reverb push + polling fallback | Instant toasts, still works when Reverb is down | One more process to run and monitor |
+| Broadcast only the notification id | No ticket data over the socket; reuse of authorized feed | One extra HTTP request per notification |
+| `ShouldBroadcastNow` (not queued) after commit | No worker needed for real-time, simple | Request waits up to the 2–3 s broadcaster timeout if Reverb hangs |
+| Global assignment `Cache::lock` | Correct least-workload choice under parallel auto-assign | Assignments are serialized (fine at this scale) |
+| Optimistic locking for edits | No long locks while a user types | User must reload and retry on conflict |
+| Pessimistic row locks for transitions | Simple, rules checked on current data | Short waits under contention |
+| `request_token` idempotency | No duplicate tickets on double submit | Hidden field + unique index to maintain |
+| Database cache/queue/locks | No Redis on XAMPP; inspectable with SQL | Slower and more DB load than Redis |
+| Cache-based email de-dup | Simple, survives job retries | Best effort, not exactly-once |
+| Timestamps kept in Asia/Dhaka | No rewrite of historical V1 data | Deviation from "store UTC" advice |
+| One role column, no permission package | Easy to explain | Not flexible for many custom roles |
+| Calendar-hour SLA | Simple | Ignores business hours/holidays |
 
 ---
 
 ## 9. Common follow-up questions and recommended answers
 
-**Q1. What happens if two admins assign the same ticket at the same time?**
-Both requests start a transaction and run `lockTicket()` (`SELECT … FOR UPDATE`). The second waits until the first
-commits, then reads the fresh row. For Auto Assign it sees the ticket is no longer Open and gets "Auto assign is only
-available for Open tickets"; for manual assign to the same agent `performAssignment()` returns false ("already
-assigned").
+**Q1. Two admins assign the same ticket at the same moment?**
+Both enter `TicketAssignmentService::withAssignmentLock()`; the second waits (up to 5 s) for `Cache::lock`. Inside,
+the ticket row is re-read `FOR UPDATE`, the version is checked, and same-agent assignment returns false ("already
+assigned"). If the lock is not free in 5 s the user sees "Another assignment is being processed right now".
 
-**Q2. Why not just hide buttons in Blade?**
-Hiding is UX. Anyone can send a POST with curl. Every controller action calls `Gate::authorize()` with the same
-`TicketPolicy`, and `TicketService` re-checks the status on the locked row. The smoke test confirmed a customer gets
-403.
+**Q2. Why a cache lock if you already have row locks?**
+Row locks protect *one* ticket. Two auto-assigns of *different* tickets lock different rows, both count the same
+workload, and both pick the same agent. The global lock makes "count workload + assign" one-at-a-time.
 
-**Q3. How do you prevent N+1 queries?**
-Eager loading with `with()` / `load()` in `TicketController`, `withCount()` for counts, and
-`Model::preventLazyLoading(! production)` in `AppServiceProvider`, which throws an exception in development if I
-forget.
+**Q3. What is optimistic locking here?**
+The edit form sends the `version` it was rendered with. `updateTicket()` runs
+`UPDATE tickets SET …, version = version + 1 WHERE id = ? AND version = ? AND status <> 'closed'`. 0 rows → 
+`TicketConflictException` (409 for JSON, redirect back with the input for forms).
 
-**Q4. Why is the email sent after commit?**
-If the transaction rolls back, the email would describe something that never happened. `DB::afterCommit()` keeps the
-dispatch until COMMIT; on rollback the callback is discarded. There is a test for it.
+**Q4. How do you stop duplicate tickets?**
+Hidden UUID `request_token`; the service first looks for an existing ticket with the same creator + token; a unique
+index catches the race; a parallel loser gets the existing ticket back. Different content with the same token → 409.
 
-**Q5. What if the email server is down?**
-The job fails, waits 10 s, retries up to 3 times, then moves to `failed_jobs` and `failed()` logs it. The ticket
-change is already committed and is never reversed. `php artisan queue:retry all` resends after fixing.
+**Q5. Why is the broadcast after commit?**
+A rolled-back assignment must not show a toast. `TicketNotifier::afterCommit()` uses `DB::afterCommit()`; on rollback
+the callback is discarded — tested in `test_no_broadcast_and_no_email_when_the_transaction_rolls_back`.
 
-**Q6. What if the queue worker is not running?**
-Ticket actions and in-app notifications still work; email jobs wait in `jobs`. I verified this: 2 jobs waited,
-`queue:work --stop-when-empty` processed both, and the emails appeared in `laravel.log`.
+**Q6. Can a user listen to someone else's notifications?**
+No. Echo must call `POST /broadcasting/auth`; `routes/channels.php` returns true only when
+`$user->id === (int) $userId && $user->is_active`. Otherwise 403. Tested, and verified live (AuthError).
 
-**Q7. Can a user read someone else's notification?**
-No. Every query starts from `$request->user()->notifications()`. `findOrFail($id)` on another user's UUID returns
-404. Tested.
+**Q7. What if Reverb is down?**
+The broadcast throws, is caught and logged as a warning; the ticket operation succeeds; `notifications.js` keeps
+polling every 5 s. Tested with a real connection refusal.
 
-**Q8. Is the notification system real-time?**
-Near-real-time. It is AJAX polling every 5 s (30 s in hidden tabs). For true push I would use Laravel Reverb with a
-broadcast channel.
+**Q8. How is customer data isolated?**
+Logical isolation in one database: the customer's `client_id` comes from their account, scope rules in
+`resolveScope()`, `visibleTo()` scopes in SQL, internal notes filtered out, policy on attachments, private channels.
+No separate tenant databases.
 
-**Q9. How do you avoid duplicate toasts?**
-The JS keeps a `Set` of shown notification ids. On first load, existing ids are added without toasts. The server
-filter is `created_at >= since` minus a 10-second overlap (for late-committed transactions), so a row can come
-twice; the Set skips it.
+**Q9. Does project membership let an agent see all project tickets?**
+No — membership controls assignment eligibility only. Visibility is still creator or assigned agent (spec §6).
 
-**Q10. Why recursive `setTimeout` and not `setInterval`?**
-The next request is scheduled only after the previous finishes, so requests never overlap on a slow server.
-Plus `isRequestRunning` and `clearTimeout` guarantee one loop.
+**Q10. How do attachments stay secure?**
+Extension and detected MIME both validated, size and count limited, private disk, UUID names, download only through
+the controller + `TicketPolicy::downloadAttachment()` (internal-note files staff-only), `Content-Disposition:
+attachment`, `nosniff`. No antivirus scanning — a known limitation.
 
-**Q11. What do you cache, and what not?**
-Admin aggregates (60 s) and the active-category dropdown (1 h). Not overdue (time-based), not workload (used for
-assignment), not permissions/auth, not unread counts, not ticket details. Validation never trusts cache.
+**Q11. Why does the SLA reminder go out only once?**
+`processSlaBreach()` locks the row, re-checks "still overdue and `sla_notified_at IS NULL`", sets
+`sla_notified_at` and notifies in one transaction. A parallel run waits and then sees it already set. Reopen and
+priority change reset it for a new breach.
 
-**Q12. How is the cache kept fresh?**
-`Cache::forget()` after each successful commit that changes the statistics, and the TTL as a safety net. A race can
-still leave stale stats for up to 60 s, which is acceptable for a dashboard.
+**Q12. What if the queue worker dies mid-email?**
+The job becomes available again after `retry_after` (90 s). `$timeout = 60` is shorter, so a running attempt is
+killed first. The delivery-key cache entry stops a second send after a successful one; a crash exactly between SMTP
+accept and cache write can still duplicate — at-least-once delivery.
 
-**Q13. How does auto-assignment choose the agent?**
-Active agents, `withCount` of tickets in Assigned/In Progress, order by that count, then by id. One SQL query with a
-sub-select.
+**Q13. How do you rate limit?**
+Named limiters in `AppServiceProvider`: ticket create 10/min, comments 30/min, feed 120/min, export 5/min, keyed by
+user id (so an office behind one IP isn't blocked together); login 5 failures per email + IP. 429 page.
 
-**Q14. Why is `due_at` DATETIME and not TIMESTAMP?**
-On MariaDB/older MySQL, the first NOT NULL TIMESTAMP column gets an implicit `ON UPDATE CURRENT_TIMESTAMP`, so every
-update overwrote the SLA deadline. I found it during seeding; DATETIME has no such behaviour.
+**Q14. How do you trace a production error?**
+`AddRequestContext` puts `request_id` and `user_id` into every log line and returns `X-Request-Id`; a user reports
+the id and you grep the log.
 
-**Q15. How would you add a new status, e.g. "On Hold"?**
-Add the constant and label in `Ticket::STATUSES`, transitions in `TRANSITIONS`, a policy method, a service method
-(transaction + lock + activity), a controller method and route, a button with `@can`, a badge colour, and tests.
-Decide whether it counts in `ACTIVE_STATUSES`/`WORKLOAD_STATUSES`.
+**Q15. How would you deploy it?**
+Documented in [18](18-PRODUCTION-DEPLOYMENT.md) (not executed): Nginx + PHP-FPM, `APP_DEBUG=false`, `config:cache`,
+`route:cache`, `view:cache`, Supervisor for `queue:work` and `reverb:start`, one cron line for `schedule:run`, TLS
+termination with a WebSocket proxy for WSS, daily logs, backups.
 
-**Q16. How would you add SLA escalation?**
-*Future:* an Artisan command scheduled every minute that finds `Ticket::overdue()` tickets without an escalation
-record and notifies admins. Not implemented.
+**Q16. How would it scale?**
+Redis for cache/queue/locks/sessions first, then more web servers behind a load balancer (sessions in Redis or DB),
+Reverb scaling via Redis, S3 for files, read replica for reports, more workers. None of this is implemented.
 
-**Q17. What did AI do, and what did you do?**
-AI generated and reviewed most code from my specification. I defined the requirements, reviewed and ran
-everything, studied every file, and wrote/used these notes. I can walk through any file and change it — please pick
-one.
+**Q17. What was hard?**
+Getting the lock order right (deadlock-free), holding broadcasts until the cache lock is released, the Reverb
+installer not writing keys, a rollback bug where an index backed a foreign key, and CRLF line endings on Windows.
 
-**Q18. What would you improve first?**
-WebSockets instead of polling for scale, Redis for cache/queue, an outbox for guaranteed email dispatch, business-hours
-SLA, file attachments, and browser tests (Dusk) for the JavaScript.
+**Q18. What did AI do, and what did you do?**
+AI generated and reviewed most code from my specifications. I defined requirements and constraints, reviewed and
+ran everything, studied each file and wrote these notes. Pick any file and I'll walk through or change it.
 
-**Q19. How do you test this?**
-`php artisan test`: 85 feature tests using `RefreshDatabase` on `resolvedesk_testing`, factories with states,
-`Queue::fake()`, `Mail::fake()`, cache assertions, and a page-rendering test that seeds demo data and opens every page
-per role.
+**Q19. What would you improve first?**
+Real browser tests (Dusk) for the JavaScript, a transactional outbox for emails, UTC timestamps with a careful data
+migration, an agent-availability flag, antivirus scanning, business-hours SLA.
 
-**Q20. What was hard / what bugs did you find?**
-The MariaDB TIMESTAMP auto-update on `due_at`; Blade compiling `@json()` inside a JavaScript comment; a multi-line
-`@include` with a ternary that failed to compile. All three are in `DEVELOPMENT_PROGRESS.md`.
+**Q20. How do you test concurrency?**
+`MySqlConcurrencyTest` opens a second database connection: one holds `FOR UPDATE`, the other must wait; a parallel
+duplicate insert hits the unique index; a stale optimistic update changes nothing. Plus manual multi-process runs
+recorded in `DEVELOPMENT_PROGRESS.md`.
 
-> **বাংলায়:** ইন্টারভিউতে প্রশ্নের উত্তর দেওয়ার সময় প্রথমে এক লাইনে মূল উত্তর দিন, তারপর কোন ফাইলে কোডটা আছে সেটা
-> বলুন, আর সম্ভব হলে কোডটা খুলে দেখান। যা implement করা হয়নি (Redis, WebSocket, outbox) সেটাকে স্পষ্টভাবে "future
-> improvement" বলুন — কখনো দাবি করবেন না যে এগুলো আছে।
+> **বাংলায়:** উত্তর দেওয়ার নিয়ম: প্রথমে এক লাইনে মূল উত্তর, তারপর কোন ফাইলে কোড আছে, তারপর সম্ভব হলে কোড খুলে
+> দেখানো। যা implement বা verify করা হয়নি (Redis, load balancer, Linux deployment, SMTP, real browser test) সেটাকে
+> পরিষ্কারভাবে "future" বা "not verified" বলুন।
 
 ---
 
@@ -308,32 +297,32 @@ The MariaDB TIMESTAMP auto-update on `due_at`; Blade compiling `@json()` inside 
 
 | Time | Do |
 |---|---|
-| 0:00–0:15 | Start XAMPP MySQL, `php -v`, `php artisan migrate:fresh --seed` (local only), `php artisan serve`, `php artisan test`. Log in with all three roles. |
-| 0:15–0:40 | Rehearse the 5-minute demo (§2) twice with three browser sessions. Confirm the toast appears. |
-| 0:40–1:05 | Read `app/Services/TicketService.php` top to bottom: `autoAssign`, `performAssignment`, `resolve`, `notifyUser`, `queueEmail`. Say each method aloud in 2 sentences. |
-| 1:05–1:20 | Read `app/Models/Ticket.php` (constants, scopes) and `app/Policies/TicketPolicy.php`. |
-| 1:20–1:35 | Skim `public/js/notifications.js` with [13-NOTIFICATION-SYSTEM-GUIDE.md](13-NOTIFICATION-SYSTEM-GUIDE.md) §10. |
-| 1:35–1:50 | Read the 20 questions in §9 and answer them aloud without looking. |
-| 1:50–2:00 | One live change: change `POLL_INTERVAL_MS` to 10000 and back; change `SLA_HOURS` high to 12, run tests, revert. |
+| 0:00–0:15 | Start MariaDB, four processes, `php artisan test`. Log in as admin and Sarah. |
+| 0:15–0:40 | Rehearse the 5-minute demo (§2) twice, including stopping Reverb. |
+| 0:40–1:05 | Read `TicketAssignmentService` and `TicketNotifier` top to bottom; say each method in 2 sentences. |
+| 1:05–1:20 | Read `TicketService::createTicket()`, `updateTicket()`, `resolveScope()`, `processSlaBreach()`. |
+| 1:20–1:35 | Read `routes/channels.php`, `UserNotificationCreated`, `resources/js/realtime.js`, the bridge part of `public/js/notifications.js`. |
+| 1:35–1:50 | Answer the 20 questions in §9 aloud. |
+| 1:50–2:00 | One live change: `max_file_kb` to 1024 in `config/resolvedesk.php`, run `InternalNotesAndAttachmentsTest`, revert. |
 
 ## 11. Four-hour detailed preparation plan
 
 | Time | Do |
 |---|---|
-| 0:00–0:20 | Environment and tests as in the 2-hour plan; read `README.md` and `DEVELOPMENT_PROGRESS.md`. |
-| 0:20–1:00 | [16-CODEBASE-LEARNING-MAP.md](16-CODEBASE-LEARNING-MAP.md) steps 1–10 (structure, routes, layouts, category CRUD, migrations, models, auth, middleware, policies, users). Do 3 exercises. |
-| 1:00–1:50 | Steps 11–17 (ticket creation → comments) with [06-BUSINESS-LOGIC-GUIDE.md](06-BUSINESS-LOGIC-GUIDE.md). Draw the lifecycle and the assignment sequence from memory. |
-| 1:50–2:30 | Steps 18–23 with guides [13](13-NOTIFICATION-SYSTEM-GUIDE.md), [14](14-QUEUE-AND-EMAIL-GUIDE.md), [15](15-CACHING-GUIDE.md). Run the queue experiment (assign → count `jobs` → `queue:work --stop-when-empty` → read `laravel.log`). Watch the cache "generated at" time change. |
-| 2:30–3:00 | Live-coding practice from [08-LIVE-CODING-PRACTICE.md](08-LIVE-CODING-PRACTICE.md): do two tasks with a timer, with tests. |
-| 3:00–3:20 | Debugging drill ([11-DEBUGGING-GUIDE.md](11-DEBUGGING-GUIDE.md)): break one transition, read the test failure, fix. |
-| 3:20–3:45 | Rehearse the 5-minute demo and the 10-minute talk (§3) out loud, timed. |
-| 3:45–4:00 | Q&A drill: §9 plus [09-INTERVIEW-QUESTIONS-AND-ANSWERS.md](09-INTERVIEW-QUESTIONS-AND-ANSWERS.md). Write down any answer you were unsure about and re-read that code. |
+| 0:00–0:20 | Environment + tests; read `README.md` and the V2 part of `DEVELOPMENT_PROGRESS.md`. |
+| 0:20–1:20 | [16](16-CODEBASE-LEARNING-MAP.md) three-hour V2 plan, first half (domain, scope, concurrency). |
+| 1:20–2:10 | Second half (notifications, real-time, notes, attachments, scheduler, reports, ops). |
+| 2:10–2:50 | Two V2 exercises from [08](08-LIVE-CODING-PRACTICE.md) with a timer, with tests (e.g. V2-3 and V2-17). |
+| 2:50–3:15 | Debugging drill from [11](11-DEBUGGING-GUIDE.md) Part 4: 409, 429, `/broadcasting/auth` 403, scheduler. |
+| 3:15–3:40 | Rehearse the 5-minute demo and the 10-minute talk, timed. |
+| 3:40–4:00 | Q&A drill: §9 + [09](09-INTERVIEW-QUESTIONS-AND-ANSWERS.md) Part 6. |
 
 ## 12. Day-of checklist
 
-- [ ] MariaDB running, `php -v` shows 8.4.28 in the terminal you use.
-- [ ] Fresh seed done; three browser sessions logged in.
-- [ ] `php artisan test` green.
-- [ ] Editor open on `TicketService.php`, `Ticket.php`, `TicketPolicy.php`, `notifications.js`.
-- [ ] A terminal ready for `php artisan queue:work --stop-when-empty` and `tinker`.
-- [ ] Your one-sentence honest AI-assistance statement (§0).
+- [ ] MariaDB running; `php -v` = 8.4.28 in all four terminals.
+- [ ] `serve`, `queue:work`, `reverb:start`, `schedule:work` running; `public/build/manifest.json` exists.
+- [ ] Admin (window A + tab A2) and Sarah (window B) logged in; small PDF ready.
+- [ ] `php artisan test` green (164 tests).
+- [ ] Editor open on `TicketAssignmentService.php`, `TicketNotifier.php`, `TicketService.php`, `TicketPolicy.php`,
+      `routes/channels.php`, `realtime.js`.
+- [ ] Your honest AI-assistance statement (§0) and the "not verified" list.

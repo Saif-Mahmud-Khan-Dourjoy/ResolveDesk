@@ -3,6 +3,8 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -19,7 +21,9 @@ class User extends Authenticatable
 
     // ---- Role values (stored in users.role) ---------------------------------
     public const ROLE_ADMIN = 'admin';
+
     public const ROLE_AGENT = 'agent';
+
     public const ROLE_CUSTOMER = 'customer';
 
     // value => human label. Used for validation and dropdowns.
@@ -40,6 +44,7 @@ class User extends Authenticatable
         'role',
         'is_active',
     ];
+    // client_id is NOT fillable: UserController sets it explicitly after its business checks.
 
     /** Never include these columns when the model is converted to an array/JSON. */
     protected $hidden = [
@@ -52,6 +57,7 @@ class User extends Authenticatable
         return [
             'password' => 'hashed',     // Automatically bcrypt-hashes a plain password when it is set.
             'is_active' => 'boolean',
+            'client_id' => 'integer',
         ];
     }
 
@@ -67,6 +73,18 @@ class User extends Authenticatable
     public function assignedTickets(): HasMany
     {
         return $this->hasMany(Ticket::class, 'assigned_to');
+    }
+
+    /** V2: the client organization of a customer (NULL = standalone customer, admin or agent). */
+    public function client(): BelongsTo
+    {
+        return $this->belongsTo(Client::class);
+    }
+
+    /** V2: projects a support agent supports (project_user pivot). Controls assignment eligibility. */
+    public function projects(): BelongsToMany
+    {
+        return $this->belongsToMany(Project::class)->withTimestamps();
     }
 
     public function ticketComments(): HasMany
@@ -94,6 +112,12 @@ class User extends Authenticatable
     public function isCustomer(): bool
     {
         return $this->role === self::ROLE_CUSTOMER;
+    }
+
+    /** Admins and agents work for the software company; they may see internal notes. */
+    public function isStaff(): bool
+    {
+        return $this->isAdmin() || $this->isAgent();
     }
 
     public function roleLabel(): string

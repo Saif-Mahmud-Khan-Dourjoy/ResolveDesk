@@ -36,6 +36,18 @@
         @if (auth()->user()->isAdmin())
             <div class="sidebar-heading">Administration</div>
 
+            <a href="{{ route('projects.index') }}" class="sidebar-link {{ request()->routeIs('projects.*') ? 'active' : '' }}">
+                <i class="bi bi-kanban"></i> Projects
+            </a>
+
+            <a href="{{ route('clients.index') }}" class="sidebar-link {{ request()->routeIs('clients.*') ? 'active' : '' }}">
+                <i class="bi bi-building"></i> Clients
+            </a>
+
+            <a href="{{ route('reports.index') }}" class="sidebar-link {{ request()->routeIs('reports.*') ? 'active' : '' }}">
+                <i class="bi bi-bar-chart-line"></i> Reports
+            </a>
+
             <a href="{{ route('users.index') }}" class="sidebar-link {{ request()->routeIs('users.*') ? 'active' : '' }}">
                 <i class="bi bi-people"></i> Users
             </a>

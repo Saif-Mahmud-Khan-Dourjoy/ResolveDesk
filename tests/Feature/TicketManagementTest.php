@@ -8,6 +8,7 @@ use App\Models\TicketActivity;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
@@ -26,6 +27,7 @@ class TicketManagementTest extends TestCase
         $category = Category::factory()->create();
 
         $response = $this->actingAs($customer)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'Cannot export invoices',
             'description' => 'The export button does nothing.',
             'category_id' => $category->id,
@@ -54,6 +56,7 @@ class TicketManagementTest extends TestCase
         $customer = User::factory()->customer()->create();
 
         $response = $this->actingAs($customer)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => '',
             'description' => '',
             'category_id' => 999,
@@ -70,6 +73,7 @@ class TicketManagementTest extends TestCase
         $inactiveCategory = Category::factory()->inactive()->create();
 
         $response = $this->actingAs($customer)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'Test', 'description' => 'Test', 'category_id' => $inactiveCategory->id, 'priority' => 'low',
         ]);
 
@@ -84,6 +88,7 @@ class TicketManagementTest extends TestCase
 
         for ($i = 0; $i < 3; $i++) {
             $this->actingAs($customer)->post('/tickets', [
+                'request_token' => (string) Str::uuid(),
                 'subject' => "Ticket {$i}", 'description' => 'x', 'category_id' => $category->id, 'priority' => 'low',
             ]);
         }
@@ -127,6 +132,7 @@ class TicketManagementTest extends TestCase
         ]);
 
         $this->actingAs($admin)->put(route('tickets.update', $ticket), [
+            'version' => $ticket->fresh()->version,
             'subject' => $ticket->subject,
             'description' => $ticket->description,
             'category_id' => $ticket->category_id,
@@ -149,12 +155,14 @@ class TicketManagementTest extends TestCase
 
         // Keeping the current inactive category is allowed.
         $this->actingAs($customer)->put(route('tickets.update', $ticket), [
+            'version' => $ticket->fresh()->version,
             'subject' => 'Updated subject', 'description' => 'd', 'category_id' => $oldCategory->id, 'priority' => 'medium',
         ])->assertSessionHasNoErrors();
         $this->assertSame('Updated subject', $ticket->fresh()->subject);
 
         // Switching to a different inactive category is not.
         $this->actingAs($customer)->put(route('tickets.update', $ticket), [
+            'version' => $ticket->fresh()->version,
             'subject' => 'Again', 'description' => 'd', 'category_id' => $otherInactive->id, 'priority' => 'medium',
         ])->assertSessionHasErrors('category_id');
     }
@@ -165,6 +173,7 @@ class TicketManagementTest extends TestCase
         $ticket = Ticket::factory()->create(['created_by' => $customer->id]);
 
         $this->actingAs($customer)->put(route('tickets.update', $ticket), [
+            'version' => $ticket->fresh()->version,
             'subject' => $ticket->subject, 'description' => $ticket->description,
             'category_id' => $ticket->category_id, 'priority' => $ticket->priority,
         ])->assertSessionHas('success', 'No changes were made.');

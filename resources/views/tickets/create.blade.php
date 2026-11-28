@@ -19,9 +19,19 @@
     <div class="col-xl-8">
         <div class="card">
             <div class="card-body p-4">
-                <form method="POST" action="{{ route('tickets.store') }}">
+                {{-- enctype is required for file uploads. data-disable-on-submit stops double clicks in
+                     the browser; the hidden request_token stops duplicates on the SERVER. --}}
+                <form method="POST" action="{{ route('tickets.store') }}" enctype="multipart/form-data" data-disable-on-submit>
                     @csrf
+                    <input type="hidden" name="request_token" value="{{ $requestToken }}">
+                    @error('request_token')<div class="alert alert-danger small">{{ $message }}</div>@enderror
+
+                    @include('tickets._scope-fields')
                     @include('tickets._form')
+
+                    <div class="mb-3">
+                        @include('tickets._attachment-input')
+                    </div>
 
                     <div class="d-flex gap-2 mt-2">
                         <button type="submit" class="btn btn-primary"><i class="bi bi-send me-1"></i> Submit Ticket</button>
@@ -33,3 +43,7 @@
     </div>
 </div>
 @endsection
+
+@push('scripts')
+    <script src="{{ asset('js/ticket-form.js') }}"></script>
+@endpush

@@ -2,7 +2,14 @@
 
 This guide explains every table, column, key and index in ResolveDesk, the Eloquent models that use them,
 and the SQL that Laravel actually runs. All facts come from `database/migrations/*.php`,
-`app/Models/*.php` and the real `SHOW CREATE TABLE` output of the development database (MariaDB 10.4).
+`app/Models/*.php` and the real `SHOW CREATE TABLE` / `SHOW INDEX` output of the development database
+(MariaDB 10.4).
+
+**V2 (multi-project upgrade):** new tables `projects`, `clients`, `client_project`, `project_user`,
+`ticket_attachments`; new columns `users.client_id`, `tickets.project_id` / `client_id` / `version` /
+`sla_notified_at` / `request_token`, `ticket_comments.visibility`, `ticket_activities.is_internal`;
+`ticket_activities.user_id` became nullable; new indexes. The business meaning of these features is in
+[22 — V2 business features](22-V2-BUSINESS-FEATURES.md).
 
 Related: [Project overview](01-PROJECT-OVERVIEW.md) · [Setup guide](02-SETUP-GUIDE.md) ·
 [Business logic](06-BUSINESS-LOGIC-GUIDE.md) · [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) ·
@@ -24,12 +31,27 @@ Related: [Project overview](01-PROJECT-OVERVIEW.md) · [Setup guide](02-SETUP-GU
 | `2026_11_25_000003_create_ticket_comments_table.php` | `ticket_comments` |
 | `2026_11_25_000004_create_ticket_activities_table.php` | `ticket_activities` |
 | `2026_11_25_140742_create_notifications_table.php` | `notifications` |
+| `2026_11_26_000001_create_projects_table.php` | V2: `projects` |
+| `2026_11_26_000002_create_clients_table.php` | V2: `clients` |
+| `2026_11_26_000003_add_client_id_to_users_table.php` | V2: `users.client_id` |
+| `2026_11_26_000004_create_project_pivot_tables.php` | V2: `client_project`, `project_user` |
+| `2026_11_26_000005_add_v2_columns_to_tickets_table.php` | V2: `tickets.project_id`, `client_id`, `sla_notified_at`, `version`, `request_token` + 4 indexes |
+| `2026_11_26_000006_add_visibility_to_comments_and_activities.php` | V2: `ticket_comments.visibility` + index, `ticket_activities.user_id` nullable, `ticket_activities.is_internal` |
+| `2026_11_26_000007_create_ticket_attachments_table.php` | V2: `ticket_attachments` |
+| `2026_11_26_000008_add_notification_feed_index.php` | V2: notifications index `(notifiable_type, notifiable_id, created_at)` |
 
 Laravel also creates the `migrations` table itself; it records which migration files have run (column
 `migration`) and in which `batch`.
 
 The order matters: `tickets` references `categories` and `users`, so those tables must exist first.
-The `2026_11_25_...` prefix guarantees that order.
+The `2026_11_25_...` prefix guarantees that order. In V2, `projects` and `clients` are created before
+`users.client_id`, the pivot tables and the new ticket columns that reference them.
+
+All V2 migrations are **additive** (new nullable columns or columns with defaults, new tables). They were applied
+to the existing development database with `php artisan migrate` (never `migrate:fresh`), so the 34 existing
+tickets became global tickets (`project_id = NULL`, `client_id = NULL`) and no client/project mapping was
+invented. Rollback implications (including why `000006` cannot be rolled back while system activities exist)
+are in [22 — section 14](22-V2-BUSINESS-FEATURES.md#14-migration-and-rollback-implications).
 
 Removed on purpose (unused): the default `email_verified_at` column, and the `password_reset_tokens` and
 `job_batches` tables.
@@ -38,7 +60,7 @@ Removed on purpose (unused): the default `email_verified_at` column, and the `pa
 
 | Business tables (our data) | Laravel infrastructure tables |
 |---|---|
-| `users`, `categories`, `tickets`, `ticket_comments`, `ticket_activities` | `notifications`, `sessions`, `cache`, `cache_locks`, `jobs`, `failed_jobs`, `migrations` |
+| `users`, `categories`, `tickets`, `ticket_comments`, `ticket_activities`, V2: `projects`, `clients`, `client_project`, `project_user`, `ticket_attachments` | `notifications`, `sessions`, `cache`, `cache_locks`, `jobs`, `failed_jobs`, `migrations` |
 
 ### 1.3 Migration syntax you will see
 
@@ -77,6 +99,7 @@ One table for **all three roles**.
 | `password` | VARCHAR(255) | no | bcrypt hash (the model cast `'password' => 'hashed'` hashes it automatically). Never plain text. |
 | `role` | VARCHAR(20) | no | `admin` / `agent` / `customer` (`User::ROLES`). **Indexed** — queries like "all active agents" filter on it. |
 | `is_active` | TINYINT(1) | no | Default `1`. Inactive users cannot log in. |
+| `client_id` | BIGINT UNSIGNED | **yes** | V2. **FK → `clients.id`**, `ON DELETE RESTRICT`. The customer's organization. `NULL` = standalone customer, or an admin/agent (they belong to the software company). Not mass assignable; set explicitly by `UserController`. |
 | `remember_token` | VARCHAR(100) | yes | Used by "Remember me". |
 | `created_at`, `updated_at` | TIMESTAMP | yes | Set automatically by Eloquent. |
 
@@ -109,14 +132,22 @@ A category used by any ticket cannot be deleted (`CategoryController::destroy()`
 | `subject` | VARCHAR(255) | no | |
 | `description` | TEXT | no | |
 | `category_id` | BIGINT UNSIGNED | no | **FK → `categories.id`**, `ON DELETE RESTRICT`. |
+| `project_id` | BIGINT UNSIGNED | **yes** | V2. **FK → `projects.id`**, `ON DELETE RESTRICT`. `NULL` = **global** ticket (not about one product). Global does **not** mean public. |
+| `client_id` | BIGINT UNSIGNED | **yes** | V2. **FK → `clients.id`**, `ON DELETE RESTRICT`. `NULL` = internal (no client organization). For customers it is copied from `users.client_id` at creation. |
 | `created_by` | BIGINT UNSIGNED | no | **FK → `users.id`**, `ON DELETE RESTRICT`. Who reported the ticket. |
 | `assigned_to` | BIGINT UNSIGNED | **yes** | **FK → `users.id`**, `ON DELETE RESTRICT`. The agent; `NULL` while unassigned. |
 | `priority` | VARCHAR(20) | no | `low` / `medium` / `high` / `critical` (`Ticket::PRIORITIES`). Indexed. |
 | `status` | VARCHAR(20) | no | `open` / `assigned` / `in_progress` / `resolved` / `closed` (`Ticket::STATUSES`). Indexed. |
 | `due_at` | **DATETIME** | no | SLA deadline = `created_at` + `Ticket::SLA_HOURS[priority]`. Indexed. |
 | `resolved_at` | **DATETIME** | **yes** | Set on resolve, cleared on reopen, kept on close. |
+| `sla_notified_at` | DATETIME | **yes** | V2. When the SLA-breach reminder was sent (`tickets:check-sla`). `NULL` = not reminded yet. Reset to `NULL` on priority change and on reopen. |
 | `resolution_note` | TEXT | **yes** | Required when resolving; cleared on reopen. |
+| `version` | INT UNSIGNED | no | V2. Default `1`. Optimistic-locking counter, `+1` on every ticket change. Forms send the version they showed; a mismatch = conflict. |
+| `request_token` | VARCHAR(64) | **yes** | V2. Idempotency key (UUID) from the create form. UNIQUE together with `created_by`. `NULL` for V1 tickets. |
 | `created_at`, `updated_at` | TIMESTAMP | yes | `created_at` is indexed. |
+
+V2: `project_id` and `client_id` are **not** in `Ticket::$fillable` and never change after creation (scope is
+immutable). There is deliberately **no `is_global` column** — it would duplicate `project_id IS NULL`.
 
 **Why `ticket_number` is nullable:** `TicketService::createTicket()` first INSERTs the row (the database
 generates `id`), then sets `ticket_number = Ticket::makeTicketNumber($ticket->id)` and saves again — both
@@ -142,7 +173,13 @@ public static function makeTicketNumber(int $id): string
 | `ticket_id` | BIGINT UNSIGNED | no | **FK → `tickets.id`**, `ON DELETE CASCADE`. |
 | `user_id` | BIGINT UNSIGNED | no | **FK → `users.id`**, `ON DELETE RESTRICT`. The author. |
 | `message` | TEXT | no | |
+| `visibility` | VARCHAR(20) | no | V2. Default `public`. `public` = reply visible to the customer; `internal` = staff-only note (`TicketComment::VISIBILITIES`). V1 comments became `public`. |
 | `created_at`, `updated_at` | TIMESTAMP | yes | Comments are shown ordered by `created_at`, then `id`. |
+
+V2 index `(ticket_id, created_at)` serves "comments of this ticket in time order"
+(`WHERE ticket_id IN (?) ORDER BY created_at, id`). It also replaced the automatic foreign key index on
+`ticket_id` (MySQL reuses an index whose first column is the FK column; `SHOW INDEX FROM ticket_comments` no
+longer lists `ticket_comments_ticket_id_foreign`).
 
 ### 2.5 `ticket_activities` (audit trail)
 
@@ -150,13 +187,81 @@ public static function makeTicketNumber(int $id): string
 |---|---|---|---|
 | `id` | BIGINT UNSIGNED | no | Primary key. |
 | `ticket_id` | BIGINT UNSIGNED | no | **FK → `tickets.id`**, `ON DELETE CASCADE`. |
-| `user_id` | BIGINT UNSIGNED | no | **FK → `users.id`**, `ON DELETE RESTRICT`. Who did it. |
-| `action` | VARCHAR(50) | no | One of the keys in `TicketActivity::ACTION_LABELS`: `created`, `updated`, `assigned`, `reassigned`, `priority_changed`, `due_date_changed`, `status_changed`, `resolved`, `reopened`, `closed`. |
+| `user_id` | BIGINT UNSIGNED | **yes** (V2) | **FK → `users.id`**, `ON DELETE RESTRICT`. Who did it. V2: `NULL` = the **system** did it (the SLA scheduler), shown as "System" (`TicketActivity::isSystem()`). |
+| `action` | VARCHAR(50) | no | One of the keys in `TicketActivity::ACTION_LABELS`: `created`, `updated`, `assigned`, `reassigned`, `priority_changed`, `due_date_changed`, `status_changed`, `resolved`, `reopened`, `closed`, V2: `comment_added`, `internal_note_added`, `attachment_added`, `sla_breached`. |
 | `old_value` | TEXT | **yes** | Readable text, e.g. `Open`, `Medium`, or the previous resolution note. `NULL` when there was no previous value (e.g. `created`). |
 | `new_value` | TEXT | **yes** | Readable text, e.g. `Assigned`, `Sarah Ahmed`. |
+| `is_internal` | TINYINT(1) | no | V2. Default `0`. `1` = staff-only entry (internal note added, its attachments); hidden from customers by `TicketActivity::scopeVisibleTo()`. |
 | `created_at`, `updated_at` | TIMESTAMP | yes | |
 
-Activities are written only by `TicketService::recordActivity()` (and the seeder). They are never edited.
+Activities are written only through `TicketActivity::record($ticket, $user, $action, $old, $new, $isInternal)`
+(called by `TicketService` and `TicketAssignmentService`, always inside the same transaction as the change) and by
+the seeder. They are never edited (no update route).
+
+### 2.6 `projects` (V2)
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | BIGINT UNSIGNED | no | Primary key. |
+| `name` | VARCHAR(150) | no | e.g. "Human Resource Management System". |
+| `code` | VARCHAR(30) | no | **UNIQUE**, stored upper case, e.g. `HRMS`. |
+| `description` | TEXT | yes | |
+| `is_active` | TINYINT(1) | no | Default `1`. Inactive = not selectable for **new** tickets; old tickets stay usable. |
+| `created_at`, `updated_at` | TIMESTAMP | yes | |
+
+Never deleted (no `destroy` route; `tickets.project_id` and the pivots use RESTRICT).
+
+### 2.7 `clients` (V2)
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | BIGINT UNSIGNED | no | Primary key. |
+| `name` | VARCHAR(150) | no | e.g. "Acme Trading Ltd." |
+| `code` | VARCHAR(30) | no | **UNIQUE**, upper case, e.g. `ACME`. |
+| `email` | VARCHAR(255) | yes | |
+| `phone` | VARCHAR(50) | yes | |
+| `address` | VARCHAR(500) | yes | |
+| `description` | TEXT | yes | |
+| `is_active` | TINYINT(1) | no | Default `1`. Inactive = its customers cannot create tickets; cannot be newly linked to a project. |
+| `created_at`, `updated_at` | TIMESTAMP | yes | |
+
+### 2.8 `client_project` (V2 pivot: which client uses which project)
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | BIGINT UNSIGNED | Primary key (a surrogate id; `belongsToMany` does not need it, but it is harmless). |
+| `client_id` | BIGINT UNSIGNED | **FK → `clients.id`**, RESTRICT. |
+| `project_id` | BIGINT UNSIGNED | **FK → `projects.id`**, RESTRICT. |
+| `created_at`, `updated_at` | TIMESTAMP | Filled because the relationships use `->withTimestamps()`. |
+
+Indexes: **UNIQUE `(project_id, client_id)`** (no duplicate link + serves "clients of project X") and
+**`(client_id)`** (serves "projects of client X").
+
+### 2.9 `project_user` (V2 pivot: which agent supports which project)
+
+Same shape as `client_project` with `project_id` (FK → `projects.id`) and `user_id` (FK → `users.id`), both
+RESTRICT, timestamps. Indexes: **UNIQUE `(project_id, user_id)`** and **`(user_id)`**.
+Only active agents can be newly added (`ProjectService::syncAgents()`). This table controls **assignment
+eligibility only**; it does not give access to tickets.
+
+### 2.10 `ticket_attachments` (V2)
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| `id` | BIGINT UNSIGNED | no | Primary key. |
+| `ticket_id` | BIGINT UNSIGNED | no | **FK → `tickets.id`**, RESTRICT. |
+| `ticket_comment_id` | BIGINT UNSIGNED | **yes** | **FK → `ticket_comments.id`**, RESTRICT. `NULL` = attached to the ticket at creation; otherwise the comment/internal note it belongs to (inherits its visibility). |
+| `uploaded_by` | BIGINT UNSIGNED | no | **FK → `users.id`**, RESTRICT. |
+| `original_name` | VARCHAR(255) | no | Shown to users and used as the download name. **Never** used as a storage path. |
+| `storage_path` | VARCHAR(255) | no | Generated path on the private disk, e.g. `ticket-attachments/2026/11/3b0c...e1.pdf` (`AttachmentService::storeFiles()`). |
+| `mime_type` | VARCHAR(150) | no | Detected from the file content (`getMimeType()`), sent as `Content-Type` on download. |
+| `size` | BIGINT UNSIGNED | no | Bytes. |
+| `created_at`, `updated_at` | TIMESTAMP | yes | |
+
+Index `(ticket_id, ticket_comment_id)`: "files of this ticket" and "ticket-level files"
+(`whereNull('ticket_comment_id')`). The file itself is in `storage/app/private/...` (disk `local`), never in
+`public/`. Note: the comment in the migration shows an older example path (`ticket-attachments/12/...`); the real
+code uses `ticket-attachments/<year>/<month>/<uuid>.<ext>`.
 
 ---
 
@@ -174,8 +279,31 @@ Activities are written only by `TicketService::recordActivity()` (and the seeder
 | `read_at` | TIMESTAMP | **yes** | `NULL` = unread. Set by `markAsRead()` / "mark all as read". |
 | `created_at`, `updated_at` | TIMESTAMP | yes | Used for ordering and the `?since=` polling filter. |
 
-Index: one composite index `(notifiable_type, notifiable_id)` created by `morphs()` — every query starts with
-"notifications of this user". There is **no foreign key** to `users` (see section 7).
+Index (V2, migration `2026_11_26_000008_add_notification_feed_index.php`): one composite index
+`notifications_notifiable_created_at_index` on `(notifiable_type, notifiable_id, created_at)`. It **replaced**
+the 2-column `(notifiable_type, notifiable_id)` index that `morphs()` created. There is **no foreign key** to
+`users` (see section 7).
+
+Why: the feed query runs on every poll and every real-time event:
+
+```sql
+SELECT * FROM notifications
+WHERE notifiable_type = 'App\Models\User' AND notifiable_id = ?
+ORDER BY created_at DESC LIMIT 5;
+```
+
+With the old index, `EXPLAIN` showed **"Using filesort"** (MySQL found the user's rows by index, then sorted them
+by `created_at` in memory). With `created_at` as the third column the rows are already stored in that order
+inside the index, so the sort disappears. The old index had the same leading columns, so keeping both would only
+cost write time and space.
+
+`EXPLAIN` on the development database after the migration (73 notification rows):
+
+| table | type | possible_keys | key | ref | Extra |
+|---|---|---|---|---|---|
+| notifications | ref | notifications_notifiable_created_at_index | notifications_notifiable_created_at_index | const,const | Using where |
+
+(no "Using filesort"). The "before" result ("Using filesort") is recorded in `DEVELOPMENT_PROGRESS.md`.
 
 Example `data` value (real row from the seeded database):
 
@@ -202,8 +330,11 @@ Used because `CACHE_STORE=database`.
 - `cache`: `key` (**PK**), `value` (MEDIUMTEXT, serialized PHP value), `expiration` (BIGINT Unix time, **indexed**).
   `Cache::remember('dashboard:admin:stats', 60, ...)` stores one row whose key has the prefix
   `resolvedesk-cache-`.
-- `cache_locks`: `key` (**PK**), `owner`, `expiration` (**indexed**). Used only by `Cache::lock()`, which this
-  project does not call; the table is part of Laravel's standard cache setup.
+- `cache_locks`: `key` (**PK**), `owner`, `expiration` (**indexed**). Used by `Cache::lock()`. V2 uses it in two
+  places: the assignment lock `Cache::lock('ticket-assignment', 10)` in `TicketAssignmentService` (row key
+  `resolvedesk-cache-ticket-assignment`, deleted again when the assignment finishes) and the scheduler's
+  `withoutOverlapping()` for `tickets:check-sla`. Acquiring a lock = INSERT a row (the primary key makes it
+  atomic: a second INSERT with the same key fails); releasing = DELETE where `key` and `owner` match.
 
 ### 3.4 `jobs` and `failed_jobs`
 
@@ -234,7 +365,20 @@ Every table has a single-column primary key: `id` (BIGINT auto-increment) everyw
 | `ticket_comments.ticket_id` | `tickets.id` | **CASCADE** | A comment has no meaning without its ticket. |
 | `ticket_comments.user_id` | `users.id` | **RESTRICT** | Keep the comment author. |
 | `ticket_activities.ticket_id` | `tickets.id` | **CASCADE** | History belongs to the ticket. |
-| `ticket_activities.user_id` | `users.id` | **RESTRICT** | Keep who made the change. |
+| `ticket_activities.user_id` | `users.id` | **RESTRICT** | Keep who made the change. V2: nullable (NULL = system). |
+| `users.client_id` (V2) | `clients.id` | **RESTRICT** | A client with customers cannot disappear. Nullable. |
+| `tickets.project_id` (V2) | `projects.id` | **RESTRICT** | Never lose which product a ticket was about. Nullable (global). |
+| `tickets.client_id` (V2) | `clients.id` | **RESTRICT** | Never lose which organization a ticket belongs to. Nullable (internal). |
+| `client_project.client_id` / `project_id` (V2) | `clients.id` / `projects.id` | **RESTRICT** | A project/client cannot be deleted while linked; remove the link first (through `ProjectService` rules). |
+| `project_user.project_id` / `user_id` (V2) | `projects.id` / `users.id` | **RESTRICT** | Same for agent links. |
+| `ticket_attachments.ticket_id` (V2) | `tickets.id` | **RESTRICT** | Attachment metadata is history; a ticket with files cannot be deleted silently. |
+| `ticket_attachments.ticket_comment_id` (V2) | `ticket_comments.id` | **RESTRICT** | Nullable. Protects the comment a file belongs to. |
+| `ticket_attachments.uploaded_by` (V2) | `users.id` | **RESTRICT** | Keep who uploaded it. |
+
+V2 adds **no new CASCADE** keys (`V2_MASTER_PROMPT.md` §11: "Do not use cascading deletes that silently remove
+important ticket history"). Note the interaction: deleting a ticket that has attachments is now refused by
+`ticket_attachments.ticket_id` (RESTRICT) even though its comments/activities would cascade. Tickets are never
+deleted by the application anyway.
 
 **`restrictOnDelete()` vs `cascadeOnDelete()`**
 
@@ -260,25 +404,31 @@ In `SHOW CREATE TABLE tickets` the RESTRICT keys appear without an `ON DELETE` c
 | `categories.name` | No duplicate category names. |
 | `tickets.ticket_number` | No two tickets with the same `TK-` number. |
 | `failed_jobs.uuid` | Identify a failed job for `queue:retry`. |
+| `projects.code`, `clients.code` (V2) | No two projects/clients with the same code. |
+| `client_project (project_id, client_id)`, `project_user (project_id, user_id)` (V2) | A link exists at most once (`sync()` never creates duplicates, and the database guarantees it). |
+| `tickets (created_by, request_token)` (V2) | **Idempotency**: one ticket per creator per form token. Two parallel submits of the same form → the second INSERT fails with a unique violation, and `TicketService::createTicket()` returns the existing ticket instead. MySQL/MariaDB allow many `NULL`s in a UNIQUE index, so V1 tickets (`request_token = NULL`) are fine. |
 
 Validation also checks uniqueness (`unique:categories,name`, etc.) to show a friendly error. The database index
 is the final guarantee, even if two requests arrive at the same time.
 
 ### 4.4 Indexes on `tickets` (and why each exists)
 
-Real indexes from `SHOW INDEX FROM tickets`:
+Real indexes from `SHOW INDEX FROM tickets` (development database, after the V2 migrations):
 
 | Index name | Columns | Used by |
 |---|---|---|
-| `PRIMARY` | `id` | Lookups by id, route model binding, `lockForUpdate()`. |
+| `PRIMARY` | `id` | Lookups by id, route model binding, `lockForUpdate()`, `chunkById()`. |
 | `tickets_ticket_number_unique` | `ticket_number` | Uniqueness; exact-match lookups. |
+| `tickets_created_by_request_token_unique` (V2) | `created_by`, `request_token` | Idempotency (UNIQUE) and the replay lookup `WHERE created_by = ? AND request_token = ?`. Its first column also serves "my tickets" (`created_by = ?`) and the `created_by` foreign key, which is why the old `tickets_created_by_foreign` index no longer exists. |
 | `tickets_category_id_foreign` | `category_id` | Created for the foreign key; category filter; `Category::withCount('tickets')`. |
-| `tickets_created_by_foreign` | `created_by` | Created for the foreign key; "my tickets" for customers (`visibleTo`, customer dashboard). |
 | `tickets_status_index` | `status` | Status filter; `GROUP BY status`; `whereIn('status', ACTIVE_STATUSES)`. |
 | `tickets_priority_index` | `priority` | Priority filter; `GROUP BY priority`. |
 | `tickets_due_at_index` | `due_at` | Overdue queries `due_at < NOW()`; `orderBy('due_at')`. |
 | `tickets_created_at_index` | `created_at` | Default sort `latest()`; date-range filter; 14-day trend chart. |
 | `tickets_assigned_to_status_index` | `assigned_to`, `status` | Agent workload and agent dashboard (below). |
+| `tickets_project_id_status_index` (V2) | `project_id`, `status` | Project details page, project filter, `ProjectService` removal guard (`WHERE project_id = ? AND ... status IN (...)`), "tickets by project". Also backs the `project_id` foreign key. |
+| `tickets_client_id_status_index` (V2) | `client_id`, `status` | Client details page, client filter, `UserController::ensureClientChangeIsAllowed()`. Also backs the `client_id` foreign key. |
+| `tickets_status_due_at_index` (V2) | `status`, `due_at` | The SLA scheduler and the overdue filter: `WHERE status IN ('open','assigned','in_progress') AND due_at < NOW()`. |
 
 **The composite index `(assigned_to, status)`.** The most important workload query is
 "how many Assigned/In Progress tickets does each agent have?":
@@ -290,8 +440,9 @@ WHERE tickets.assigned_to = ? AND tickets.status IN ('assigned', 'in_progress');
 
 A composite index is sorted first by `assigned_to`, then by `status` inside each agent. The database jumps
 directly to the rows of that agent **and** that status, without reading the agent's other tickets.
-It is used by `TicketService::findLeastBusyAgent()`, `TicketController::agentList()`, the admin "agent workload"
-table and the agent dashboard counts.
+It is used by `TicketAssignmentService::findLeastBusyAgent()` and `eligibleAgents()` (V2; assignment moved out
+of `TicketService`), `ProjectService::syncAgents()` (removal guard), `UserController` (deactivation rule), the
+admin "agent workload" table and the agent dashboard counts.
 
 A composite index also works for queries on its **leftmost column alone** (`WHERE assigned_to = ?`). That is why
 there is no separate `tickets_assigned_to_foreign` index: MySQL/MariaDB need an index on every foreign key
@@ -303,9 +454,24 @@ that is what `tickets_status_index` is for.
 > "এই এজেন্টের কয়টা Assigned/In Progress টিকিট" প্রশ্নের উত্তর খুব দ্রুত পাওয়া যায়। তবে index বেশি হলে INSERT/UPDATE
 > একটু ধীর হয় আর জায়গা লাগে, তাই শুধু বারবার ব্যবহৃত কোয়েরির জন্য index রাখা হয়েছে।
 
-Other indexes: `users.role`, `sessions.user_id`, `sessions.last_activity`, `cache.expiration`,
-`cache_locks.expiration`, `jobs.queue`, `notifications(notifiable_type, notifiable_id)`, and the automatic
-foreign key indexes on `ticket_comments` and `ticket_activities` (`ticket_id`, `user_id`).
+Other indexes: `users.role`, `users_client_id_foreign` (V2), `sessions.user_id`, `sessions.last_activity`,
+`cache.expiration`, `cache_locks.expiration`, `jobs.queue`,
+`notifications(notifiable_type, notifiable_id, created_at)` (V2, section 3.1),
+`ticket_comments(ticket_id, created_at)` (V2) + `ticket_comments.user_id`, the automatic foreign key indexes on
+`ticket_activities` (`ticket_id`, `user_id`), `projects.code` / `clients.code` (UNIQUE), the pivot indexes
+(section 2.8/2.9) and `ticket_attachments(ticket_id, ticket_comment_id)` + its FK indexes.
+
+**Pivot indexes in both directions.** `UNIQUE (project_id, user_id)` answers "agents of project 1"
+(`WHERE project_id = 1`, leftmost column) and prevents duplicates. It cannot answer "projects of agent 2"
+efficiently (`WHERE user_id = 2` is not the leftmost column), so `project_user_user_id_index` exists for
+`User::projects()` and `whereHas('projects', ...)` in `findLeastBusyAgent()`. Same idea for `client_project`.
+
+**Index trade-off (interview answer).** Each index makes matching reads faster but every INSERT/UPDATE of the
+indexed columns must also update the index, and it uses disk space and buffer memory. So V2 only added indexes
+for real query patterns, reused composite indexes for foreign keys instead of adding separate ones, and
+**replaced** (not duplicated) the notifications index. With the small development data the optimizer sometimes
+still chooses another plan (for example the SLA chunk query uses `PRIMARY` on 34 rows because it must order by
+id); the indexes matter once the tables grow.
 
 ### 4.5 Nullable columns and nullable relationships
 
@@ -318,6 +484,12 @@ foreign key indexes on `ticket_comments` and `ticket_activities` (`ticket_id`, `
 | `ticket_activities.old_value`, `new_value` | Some actions have no old value (e.g. `created`, first `assigned`). |
 | `notifications.read_at` | `NULL` means **unread**. |
 | `sessions.user_id` | Guests have a session but no user. |
+| `users.client_id` (V2) | Standalone customers, admins and agents. |
+| `tickets.project_id` / `client_id` (V2) | Global ticket / internal ticket. |
+| `tickets.sla_notified_at` (V2) | No SLA reminder sent yet. |
+| `tickets.request_token` (V2) | V1 tickets created before idempotency existed. |
+| `ticket_activities.user_id` (V2) | System action (SLA scheduler). |
+| `ticket_attachments.ticket_comment_id` (V2) | File attached to the ticket itself. |
 | `jobs.reserved_at` | `NULL` until a worker picks the job up. |
 | `created_at`, `updated_at` | Laravel's `timestamps()` creates nullable columns; Eloquent always fills them. |
 
@@ -325,11 +497,11 @@ foreign key indexes on `ticket_comments` and `ticket_activities` (`ticket_id`, `
 `null`. The code always checks for it:
 
 ```php
-// app/Services/TicketService.php — performAssignment()
-$previousAgent = $ticket->assignedAgent; // null if the ticket was unassigned
+// app/Services/TicketAssignmentService.php — performAssignment()
+$previousAgent = $ticket->assigned_to ? User::find($ticket->assigned_to) : null;
 ...
 if ($previousAgent === null) {
-    $this->recordActivity($ticket, $admin, 'assigned', null, $agent->name);
+    TicketActivity::record($ticket, $admin, 'assigned', null, $agent->name);
 ```
 
 In Blade you will see the null-safe operator, e.g. `$ticket->assignedAgent?->name`, so an unassigned ticket
@@ -479,13 +651,21 @@ So a notification row says "this belongs to `App\Models\User` number 6". If late
 `Notifiable`, its rows would have `notifiable_type = 'App\Models\Team'` in the same table.
 
 Because `notifiable_id` can point to different tables, the database **cannot have a real foreign key** on it.
-That is why there is a composite index `(notifiable_type, notifiable_id)` but no FK constraint.
+That is why there is a composite index `(notifiable_type, notifiable_id, created_at)` (V2 migration 000008; it replaced Laravel's 2-column index) but no FK constraint.
 
-**How a row is created** — `TicketService::notifyUser()` calls:
+**How a row is created** — `App\Services\TicketNotifier::notify()` (V2; it replaced the private
+`TicketService::notifyUser()`) calls:
 
 ```php
-$recipient->notify(new TicketNotification($ticket, $eventType, $title, $message));
+$notification = new TicketNotification($ticket, $eventType, $title, $message);
+// We choose the UUID ourselves so we know which notifications.id row was created
+// (Laravel keeps an id that is already set).
+$notification->id = (string) Str::uuid();
+$recipient->notify($notification);
 ```
+
+Knowing the id lets V2 broadcast only `{"notification_id": "..."}` after commit and use it as the email
+`delivery_key`.
 
 1. `TicketNotification::via()` returns `['database']` → use the database channel.
 2. Laravel calls `TicketNotification::toArray()` and JSON-encodes the result into `data`.
@@ -507,17 +687,21 @@ $recipient->notify(new TicketNotification($ticket, $eventType, $title, $message)
 
 | Model | Table | Key settings |
 |---|---|---|
-| `App\Models\User` | `users` | `$fillable`: name, email, password, role, is_active. `$hidden`: password, remember_token. Casts: `password` → `hashed`, `is_active` → boolean. Constants `ROLES`, `ROLE_ADMIN`, `ROLE_AGENT`, `ROLE_CUSTOMER`. Helpers `isAdmin()`, `isAgent()`, `isCustomer()`, `roleLabel()`. |
+| `App\Models\User` | `users` | `$fillable`: name, email, password, role, is_active (V2: `client_id` is **not** fillable). `$hidden`: password, remember_token. Casts: `password` → `hashed`, `is_active` → boolean, `client_id` → integer. Constants `ROLES`, `ROLE_ADMIN`, `ROLE_AGENT`, `ROLE_CUSTOMER`. Helpers `isAdmin()`, `isAgent()`, `isCustomer()`, V2 `isStaff()` (admin or agent), `roleLabel()`. |
 | `App\Models\Category` | `categories` | `$fillable`: name, description, is_active. Cast `is_active` → boolean. `activeForDropdown()` (cached), `clearActiveCache()`. |
-| `App\Models\Ticket` | `tickets` | `$fillable`: **only** subject, description, category_id, priority. Casts: `category_id`, `created_by`, `assigned_to` → integer; `due_at`, `resolved_at` → datetime. Constants, helpers and scopes (below). |
-| `App\Models\TicketComment` | `ticket_comments` | `$fillable`: only `message` (`ticket_id`, `user_id` are set by `TicketService`). |
-| `App\Models\TicketActivity` | `ticket_activities` | `$fillable`: ticket_id, user_id, action, old_value, new_value. `ACTION_LABELS`, `actionLabel()`. |
+| `App\Models\Ticket` | `tickets` | `$fillable`: **only** subject, description, category_id, priority. Casts: `category_id`, `created_by`, `assigned_to`, V2 `project_id`, `client_id`, `version` → integer; `due_at`, `resolved_at`, V2 `sla_notified_at` → datetime. Constants, helpers and scopes (below). |
+| `App\Models\TicketComment` | `ticket_comments` | `$fillable`: only `message` (`ticket_id`, `user_id`, V2 `visibility` are set by `TicketService`). V2: `VISIBILITIES`, `isInternal()`, `scopeVisibleTo()`, `attachments()`. |
+| `App\Models\TicketActivity` | `ticket_activities` | `$fillable`: ticket_id, user_id, action, old_value, new_value, V2 is_internal. `ACTION_LABELS`, `actionLabel()`, V2 static `record()`, `scopeVisibleTo()`, `isSystem()`. |
+| `App\Models\Project` (V2) | `projects` | `$fillable`: name, code, description, is_active. Cast `is_active`. `clients()`, `agents()` (belongsToMany), `tickets()`, `scopeActive()`, `displayName()` ("HRMS - Human Resource Management System"). |
+| `App\Models\Client` (V2) | `clients` | `$fillable`: name, code, email, phone, address, description, is_active. `projects()` (belongsToMany), `customers()` (hasMany users), `tickets()`, `scopeActive()`, `displayName()`. |
+| `App\Models\TicketAttachment` (V2) | `ticket_attachments` | `$fillable = []` (every column is set explicitly by `AttachmentService`). `ticket()`, `comment()`, `uploader()`, `readableSize()`. |
 
 Table names are not written in the models: Laravel converts the class name to snake_case plural
 (`TicketComment` → `ticket_comments`).
 
 **Why `Ticket::$fillable` is so short:** `created_by`, `assigned_to`, `status`, `due_at`, `ticket_number`,
-`resolved_at` and `resolution_note` must never come from a form. Even if an attacker adds `status=closed` to the
+`resolved_at`, `resolution_note` and (V2) `project_id`, `client_id`, `version`, `sla_notified_at`,
+`request_token` must never come from a form. Even if an attacker adds `status=closed` to the
 POST data, `$ticket->fill($data)` ignores it (mass-assignment protection).
 
 **Why integer casts on the foreign keys:** policies compare with `===`, e.g. `$ticket->created_by === $user->id`.
@@ -539,10 +723,89 @@ Without the cast, a value could arrive as the string `"6"` from some drivers and
 | `Ticket::comments()` | hasMany | default `ticket_id` | Comments ordered by `created_at`, then `id` |
 | `Ticket::activities()` | hasMany | default `ticket_id` | Activities ordered by `created_at`, then `id` |
 | `TicketComment::ticket()` / `user()` | belongsTo | default `ticket_id` / `user_id` | Parent ticket / author |
-| `TicketActivity::ticket()` / `user()` | belongsTo | default `ticket_id` / `user_id` | Parent ticket / actor |
+| `TicketActivity::ticket()` / `user()` | belongsTo | default `ticket_id` / `user_id` | Parent ticket / actor (**null** for system activities) |
+| `User::client()` (V2) | belongsTo | default `client_id` | The customer's organization, or **null** |
+| `User::projects()` (V2) | belongsToMany | pivot `project_user` | Projects the agent supports |
+| `Project::clients()` (V2) | belongsToMany | pivot `client_project` | Clients using the project |
+| `Project::agents()` (V2) | belongsToMany | `User::class`, pivot `project_user` | Agents supporting the project |
+| `Project::tickets()` (V2) | hasMany | default `project_id` | Tickets of the project |
+| `Client::projects()` (V2) | belongsToMany | pivot `client_project` | Projects the client uses |
+| `Client::customers()` (V2) | hasMany | `User::class`, default `client_id` | Customer users of the organization |
+| `Client::tickets()` (V2) | hasMany | default `client_id` | Tickets of the organization |
+| `Ticket::project()` / `client()` (V2) | belongsTo | default `project_id` / `client_id` | **null** for global / internal tickets |
+| `Ticket::attachments()` (V2) | hasMany | default `ticket_id` | All files, ordered by id |
+| `TicketComment::attachments()` (V2) | hasMany | default `ticket_comment_id` | Files of the comment |
+| `TicketAttachment::ticket()` / `comment()` / `uploader()` (V2) | belongsTo | `ticket_id` / `'ticket_comment_id'` / `'uploaded_by'` | Parent ticket / comment (nullable) / uploader |
 
 - **hasMany** = "I am the parent; the child table has a column pointing to me." (`Category` → many `Ticket`s.)
 - **belongsTo** = "I hold the foreign key column." (`Ticket` has `category_id`.)
+- **belongsToMany** (V2) = "many on both sides, connected by a pivot table". Neither `projects` nor `users`
+  holds the other's id; the pivot `project_user` holds both.
+
+### 8.1.1 How `belongsToMany` works (V2)
+
+```php
+// app/Models/Project.php
+public function agents(): BelongsToMany
+{
+    return $this->belongsToMany(User::class)->withTimestamps();
+}
+```
+
+Laravel guesses everything from the two model names:
+
+| Guess | Value | How |
+|---|---|---|
+| Pivot table | `project_user` | the two singular snake_case names in **alphabetical** order (`project` < `user`) |
+| Foreign key of this model | `project_id` | `Project` → `project_id` |
+| Related key | `user_id` | `User` → `user_id` |
+
+That is why the method can be named `agents()` (not `users()`) without extra arguments — the related class
+`User::class` decides the column names, not the method name. `Project::clients()` uses `client_project`
+(`client` < `project`). `withTimestamps()` fills the pivot's `created_at`/`updated_at` on `attach()`/`sync()`.
+
+Reading — `$project->agents` (lazy) or `Project::with('agents')` (eager):
+
+```sql
+SELECT users.*, project_user.project_id AS pivot_project_id, project_user.user_id AS pivot_user_id,
+       project_user.created_at AS pivot_created_at, project_user.updated_at AS pivot_updated_at
+FROM users INNER JOIN project_user ON users.id = project_user.user_id
+WHERE project_user.project_id = 1;                -- eager: project_user.project_id IN (1, 2, ...)
+```
+
+Existence check — `$project->agents()->where('users.id', 2)->exists()` (used in `TicketService::resolveScope()`):
+
+```sql
+SELECT EXISTS(SELECT * FROM users INNER JOIN project_user ON users.id = project_user.user_id
+              WHERE project_user.project_id = 1 AND users.id = 2) AS `exists`;
+```
+
+`whereHas` — `User::whereHas('projects', fn ($q) => $q->where('projects.id', 1))` (used in
+`TicketAssignmentService::findLeastBusyAgent()`):
+
+```sql
+SELECT * FROM users WHERE EXISTS (
+  SELECT * FROM projects INNER JOIN project_user ON projects.id = project_user.project_id
+  WHERE users.id = project_user.user_id AND projects.id = 1);
+```
+
+Writing — `$project->agents()->sync([3, 4])` (used in `ProjectService::syncAgents()`):
+
+```sql
+SELECT * FROM project_user WHERE project_id = 1;                       -- current links, e.g. 2, 3
+DELETE FROM project_user WHERE project_id = 1 AND user_id IN (2);      -- detach removed
+INSERT INTO project_user (project_id, user_id, created_at, updated_at)
+VALUES (1, 4, NOW(), NOW());                                            -- attach added
+```
+
+`sync()` = "make the pivot match exactly this list". `syncWithoutDetaching()` (used by `V2DemoDataSeeder`) only
+adds. Note the qualified column names `users.id` / `clients.id`: after the JOIN both tables have an `id`, so an
+unqualified `id` would be ambiguous (SQL error 1052).
+
+> **বাংলায়:** `belongsToMany` হলো many-to-many সম্পর্ক — একটা project-এ অনেক agent, একজন agent অনেক project-এ।
+> কোনো টেবিলেই অন্যটার id রাখা যায় না, তাই মাঝখানে pivot টেবিল (`project_user`) থাকে, যেখানে প্রতিটা সারি একটা
+> সংযোগ। Laravel দুই মডেলের নাম বর্ণানুক্রমে সাজিয়ে pivot টেবিলের নাম অনুমান করে। `sync()` pivot-কে ঠিক দেওয়া
+> তালিকার মতো বানায় — যা নেই তা মুছে, যা নতুন তা যোগ করে।
 
 ### 8.2 Ticket constants, helpers and scopes
 
@@ -560,6 +823,11 @@ public const SLA_HOURS = [
 - `Ticket::makeTicketNumber($id)`, `canPerform($action)`, `isOverdue()`, `isClosed()`, `statusLabel()`,
   `priorityLabel()`.
 - Scopes (methods named `scopeXxx`, called as `Ticket::xxx()`): `scopeOverdue()` and `scopeVisibleTo()`.
+- V2 constants: `OPEN_OR_REOPENABLE_STATUSES` (open, assigned, in_progress, resolved — used by removal guards).
+- V2 helpers: `ensureVersion(?int)` (optimistic lock check, throws `TicketConflictException`),
+  `canBeAssignedTo(User)` (eligibility, reads `project_user`), `isGlobal()`, `resolvedWithinSla()`,
+  `slaRemainingForHumans()`, static `slaSummary(Builder)` (one aggregate query, see
+  [22 — section 13](22-V2-BUSINESS-FEATURES.md#13-reports-and-csv-export)).
 
 ### 8.3 Lazy loading is disabled outside production
 
@@ -587,6 +855,12 @@ seed run; the shape is what matters. All demo passwords are `password` (local on
 **users** (`id`, `name`, `role`): 1 Nadia Rahman `admin`; 2 Sarah Ahmed, 3 David Chen, 4 Fatima Khan,
 5 Michael Brown `agent`; 6 John Carter, 7 Emily Watson, 8 Rahim Uddin, 9 Olivia Martin, 10 Tanvir Hasan
 `customer` (Tanvir has `is_active = 0`).
+
+**V2 demo data** (`V2DemoDataSeeder`): projects 1 HRMS, 2 ERP, 3 PAYROLL, 4 ACCT, 5 INV (`is_active = 0`);
+clients 1 ACME, 2 GLOBEX, 3 BRIGHT (`is_active = 0`); `client_project`: HRMS–ACME, HRMS–GLOBEX, HRMS–BRIGHT,
+PAYROLL–ACME, ERP–GLOBEX, INV–GLOBEX; `project_user`: Sarah (HRMS, PAYROLL), David (ERP, HRMS), Fatima
+(PAYROLL, ACCT), Michael (ERP, INV). On a fresh seed John and Emily get `client_id` = ACME and Rahim GLOBEX;
+Olivia and Tanvir stay standalone. (On the existing development database no customer was linked.)
 
 **categories**: 1 Technical Issue, 2 Software Bug, 3 Account Access, 4 Billing, 5 Feature Request,
 6 General Inquiry, 7 Legacy Desktop App (`is_active = 0`).
@@ -633,10 +907,12 @@ Tip: to see the real SQL, run `php artisan tinker` and use `->toSql()` (shows `?
 ### 10.1 Ticket list for a non-admin (`TicketController::index()`)
 
 ```php
-Ticket::with(['category', 'creator', 'assignedAgent'])
-    ->visibleTo($user)
-    ->latest()
-    ->paginate(self::PER_PAGE);
+$query = Ticket::with(['category', 'project', 'client', 'creator', 'assignedAgent'])
+    ->visibleTo($user); // authorization FIRST, filters only narrow it further
+
+$this->applyFilters($query, $request, $user);   // V2: shared with ReportController
+
+$tickets = $query->latest()->paginate(self::PER_PAGE)->withQueryString();
 ```
 
 ```sql
@@ -644,6 +920,8 @@ SELECT COUNT(*) AS aggregate FROM tickets WHERE (created_by = 6 OR assigned_to =
 SELECT * FROM tickets WHERE (created_by = 6 OR assigned_to = 6)
 ORDER BY created_at DESC LIMIT 15 OFFSET 0;
 SELECT * FROM categories WHERE id IN (4, 6, 3);          -- eager load: category
+SELECT * FROM projects WHERE id IN (1, 3);               -- eager load: project (NULLs skipped)
+SELECT * FROM clients WHERE id IN (1);                   -- eager load: client
 SELECT * FROM users WHERE id IN (6);                      -- eager load: creator
 SELECT * FROM users WHERE id IN (3, 2);                   -- eager load: assignedAgent (NULLs skipped)
 ```
@@ -653,6 +931,8 @@ become `created_by = 6 OR (assigned_to = 6 AND status = 'open')` — wrong resul
 adds nothing.
 
 Search adds: `AND (ticket_number LIKE '%TK-00%' OR subject LIKE '%TK-00%')`.
+V2 filters add: `project_id=global` → `AND project_id IS NULL`; `project_id=1` → `AND project_id = 1`;
+(admin only) `client_id=internal` → `AND client_id IS NULL`; `assigned_to=unassigned` → `AND assigned_to IS NULL`.
 
 ### 10.2 Overdue tickets (`Ticket::overdue()->count()`)
 
@@ -661,11 +941,16 @@ SELECT COUNT(*) AS aggregate FROM tickets
 WHERE status IN ('open', 'assigned', 'in_progress') AND due_at < '2026-11-25 14:00:00';
 ```
 
-### 10.3 Least-busy agent (`TicketService::findLeastBusyAgent()`)
+### 10.3 Least-busy agent (`TicketAssignmentService::findLeastBusyAgent()`, V2)
 
 ```php
 User::where('role', User::ROLE_AGENT)
     ->where('is_active', true)
+    ->when($projectId !== null, function ($query) use ($projectId) {
+        $query->whereHas('projects', function ($projectQuery) use ($projectId) {
+            $projectQuery->where('projects.id', $projectId);
+        });
+    })
     ->withCount(['assignedTickets as workload_count' => function ($query) {
         $query->whereIn('status', Ticket::WORKLOAD_STATUSES);
     }])
@@ -681,11 +966,14 @@ SELECT users.*,
           AND status IN ('assigned', 'in_progress')) AS workload_count
 FROM users
 WHERE role = 'agent' AND is_active = 1
+  AND EXISTS (SELECT * FROM projects INNER JOIN project_user ON projects.id = project_user.project_id
+              WHERE users.id = project_user.user_id AND projects.id = 1)   -- only for project tickets
 ORDER BY workload_count ASC, id ASC
 LIMIT 1;
 ```
 
-The sub-query uses the `(assigned_to, status)` index. `ORDER BY id` is the tie-breaker so the result is always
+The workload sub-query has **no** project condition: workload is counted across all projects. The sub-query uses
+the `(assigned_to, status)` index; the `EXISTS` uses `project_user_user_id_index`. `ORDER BY id` is the tie-breaker so the result is always
 the same for equal workloads.
 
 ### 10.4 Row lock (`TicketService::lockTicket()`)
@@ -701,24 +989,55 @@ SELECT * FROM tickets WHERE tickets.id = 7 LIMIT 1 FOR UPDATE;
 Inside `DB::transaction()`, another request trying to lock the same row waits until this transaction commits
 or rolls back.
 
+V2 adds two related patterns:
+
+```php
+Project::whereKey($projectId)->sharedLock()->first();     // TicketService::resolveScope(), TicketAssignmentService
+Project::whereKey($project->id)->lockForUpdate()->firstOrFail();   // ProjectService::syncAgents()/syncClients()
+```
+
+```sql
+SELECT * FROM projects WHERE id = 1 LIMIT 1 LOCK IN SHARE MODE;   -- many readers together, blocks FOR UPDATE
+SELECT * FROM projects WHERE id = 1 LIMIT 1 FOR UPDATE;           -- exclusive
+```
+
+and the optimistic version check of `TicketService::updateTicket()` (one conditional UPDATE, no lock held while
+the user edits):
+
+```sql
+UPDATE tickets SET subject = ?, ..., version = version + 1, updated_at = ?
+WHERE id = 7 AND version = 3 AND status <> 'closed';   -- 0 rows affected = someone else changed it -> conflict
+```
+
 ### 10.5 Ticket creation (`TicketService::createTicket()`)
 
 ```sql
+SELECT * FROM tickets WHERE created_by = 7 AND request_token = '<uuid>' LIMIT 1;   -- V2 replay check
 START TRANSACTION;
-INSERT INTO tickets (subject, description, category_id, priority, created_by, assigned_to, status,
-                     created_at, due_at, updated_at)
-VALUES ('PDF export cuts off...', '...', 2, 'medium', 7, NULL, 'open',
+-- V2 resolveScope(): e.g. customer of client 1 choosing project 1
+SELECT EXISTS(SELECT * FROM clients WHERE id = 1 AND is_active = 1) AS `exists`;
+SELECT * FROM projects WHERE id = 1 LIMIT 1 LOCK IN SHARE MODE;
+SELECT EXISTS(SELECT * FROM clients INNER JOIN client_project ON clients.id = client_project.client_id
+              WHERE client_project.project_id = 1 AND clients.id = 1) AS `exists`;
+INSERT INTO tickets (subject, description, category_id, priority, project_id, client_id, created_by,
+                     assigned_to, status, version, request_token, created_at, due_at, updated_at)
+VALUES ('PDF export cuts off...', '...', 2, 'medium', 1, 1, 7, NULL, 'open', 1, '<uuid>',
         '2026-11-25 09:32:59', '2026-11-26 09:32:59', '2026-11-25 09:32:59');
 UPDATE tickets SET ticket_number = 'TK-000007', updated_at = '...' WHERE id = 7;
-INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, created_at, updated_at)
-VALUES (7, 7, 'created', NULL, 'Open', '...', '...');
+INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, is_internal, created_at, updated_at)
+VALUES (7, 7, 'created', NULL, 'Open', 0, '...', '...');
 SELECT * FROM users WHERE role = 'admin' AND is_active = 1;
 -- one notification per active admin (not the creator): "New ticket created", event_type "created"
 INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, read_at, created_at, updated_at)
 VALUES ('<uuid>', 'App\\Notifications\\TicketNotification', 'App\\Models\\User', 1, '{...,"event_type":"created"}', NULL, '...', '...');
 COMMIT;
--- after COMMIT (DB::afterCommit): one INSERT INTO jobs (SendTicketEmail) per notified admin
+-- after COMMIT (DB::afterCommit, TicketNotifier): broadcast to Reverb + one INSERT INTO jobs (SendTicketEmail)
+-- per notified admin
 ```
+
+With attachments, the files are written to `storage/app/private/ticket-attachments/...` **before**
+`START TRANSACTION`, and one `INSERT INTO ticket_attachments` per file runs inside it (deleted from disk again if
+the transaction fails).
 
 ### 10.6 Dashboard statistics (`DashboardController::buildAdminStatistics()`)
 
@@ -731,23 +1050,51 @@ SELECT DATE(created_at) AS day, COUNT(*) AS total FROM tickets
 WHERE created_at >= '2026-11-12 00:00:00' GROUP BY day;
 SELECT AVG(TIMESTAMPDIFF(MINUTE, created_at, resolved_at)) FROM tickets
 WHERE status IN ('resolved', 'closed') AND resolved_at IS NOT NULL LIMIT 1;
+-- V2
+SELECT COUNT(*) AS aggregate FROM tickets WHERE project_id IS NULL;                       -- global tickets
+SELECT projects.code, COUNT(*) AS total FROM tickets
+  INNER JOIN projects ON projects.id = tickets.project_id GROUP BY projects.code ORDER BY total DESC;
+SELECT clients.code, COUNT(*) AS total FROM tickets
+  INNER JOIN clients ON clients.id = tickets.client_id GROUP BY clients.code ORDER BY total DESC;
+SELECT COUNT(*) AS aggregate FROM tickets WHERE client_id IS NULL;                        -- "Internal"
+SELECT COUNT(*) AS total, COALESCE(SUM(status IN ('open','assigned','in_progress')), 0) AS active, ...
+  FROM tickets;                                                                           -- Ticket::slaSummary()
+SELECT COUNT(*) FROM projects WHERE is_active = 1;
+SELECT COUNT(*) FROM clients WHERE is_active = 1;
+SELECT COUNT(*) FROM users WHERE role = 'agent' AND is_active = 1;
 ```
 
 ### 10.7 Ticket details page (`TicketController::show()`)
 
 ```php
-$ticket->load(['category', 'creator', 'assignedAgent', 'comments.user', 'activities.user']);
+$ticket->load([
+    'category', 'project', 'client', 'creator', 'assignedAgent',
+    'comments' => fn ($query) => $query->visibleTo($user)->with(['user', 'attachments']),
+    'activities' => fn ($query) => $query->visibleTo($user)->with('user'),
+    'attachments' => fn ($query) => $query->whereNull('ticket_comment_id'),
+]);
 ```
 
 ```sql
 SELECT * FROM categories WHERE id IN (2);
+SELECT * FROM projects WHERE id IN (1);
+SELECT * FROM clients WHERE id IN (1);
 SELECT * FROM users WHERE id IN (7);
 SELECT * FROM users WHERE id IN (2);
-SELECT * FROM ticket_comments WHERE ticket_id IN (7) ORDER BY created_at ASC, id ASC;
+SELECT * FROM ticket_comments WHERE ticket_id IN (7)
+  AND visibility = 'public'                   -- V2: only for customers
+  ORDER BY created_at ASC, id ASC;
 SELECT * FROM users WHERE id IN (...);        -- authors of those comments
-SELECT * FROM ticket_activities WHERE ticket_id IN (7) ORDER BY created_at ASC, id ASC;
-SELECT * FROM users WHERE id IN (7, 1);       -- actors of those activities
+SELECT * FROM ticket_attachments WHERE ticket_comment_id IN (...);   -- files of those comments
+SELECT * FROM ticket_activities WHERE ticket_id IN (7)
+  AND is_internal = 0                         -- V2: only for customers
+  ORDER BY created_at ASC, id ASC;
+SELECT * FROM users WHERE id IN (7, 1);       -- actors (system activities have user_id NULL: skipped)
+SELECT * FROM ticket_attachments WHERE ticket_id IN (7) AND ticket_comment_id IS NULL ORDER BY id;
 ```
+
+Customers never receive internal notes or internal activities: they are removed **in SQL**, not only hidden in
+Blade.
 
 ### 10.8 Notifications (`NotificationController`)
 
@@ -804,10 +1151,25 @@ WHERE u.role = 'agent' AND u.is_active = 1
 GROUP BY u.id, u.name
 ORDER BY active_tickets, u.id;
 
--- Full history of one ticket
-SELECT a.created_at, u.name, a.action, a.old_value, a.new_value
-FROM ticket_activities a JOIN users u ON u.id = a.user_id
+-- Full history of one ticket (LEFT JOIN: V2 system activities have user_id NULL)
+SELECT a.created_at, COALESCE(u.name, 'System') AS actor, a.action, a.old_value, a.new_value, a.is_internal
+FROM ticket_activities a LEFT JOIN users u ON u.id = a.user_id
 WHERE a.ticket_id = 7 ORDER BY a.created_at, a.id;
+
+-- V2: agents of a project, projects of a client
+SELECT u.id, u.name, u.is_active FROM project_user pu JOIN users u ON u.id = pu.user_id WHERE pu.project_id = 1;
+SELECT p.code, p.is_active FROM client_project cp JOIN projects p ON p.id = cp.project_id WHERE cp.client_id = 1;
+
+-- V2: tickets that block removing agent 2 from project 1
+SELECT ticket_number, status FROM tickets
+WHERE project_id = 1 AND assigned_to = 2 AND status IN ('open', 'assigned', 'in_progress', 'resolved');
+
+-- V2: overdue tickets still waiting for an SLA reminder
+SELECT ticket_number, due_at FROM tickets
+WHERE status IN ('open', 'assigned', 'in_progress') AND due_at < NOW() AND sla_notified_at IS NULL;
+
+-- V2: held assignment lock (should be empty when no assignment is running)
+SELECT * FROM cache_locks;
 
 -- Unassigned tickets (LEFT JOIN keeps rows whose assigned_to is NULL)
 SELECT t.ticket_number, t.subject, agent.name AS agent
@@ -823,15 +1185,27 @@ SELECT uuid, failed_at, LEFT(exception, 200) FROM failed_jobs;
 
 ## 11. Complete ER diagram
 
+Updated for V2 (all migrations up to `2026_11_26_000008`).
+
 ```mermaid
 erDiagram
     USERS ||--o{ TICKETS : "creates (created_by)"
     USERS |o--o{ TICKETS : "is assigned (assigned_to, nullable)"
     CATEGORIES ||--o{ TICKETS : "classifies (category_id)"
+    PROJECTS |o--o{ TICKETS : "project_id (nullable = global)"
+    CLIENTS |o--o{ TICKETS : "client_id (nullable = internal)"
+    CLIENTS |o--o{ USERS : "client_id (customers only, nullable)"
+    CLIENTS ||--o{ CLIENT_PROJECT : "uses"
+    PROJECTS ||--o{ CLIENT_PROJECT : "used by"
+    PROJECTS ||--o{ PROJECT_USER : "supported by"
+    USERS ||--o{ PROJECT_USER : "supports (agents)"
     TICKETS ||--o{ TICKET_COMMENTS : "has (cascade)"
     USERS ||--o{ TICKET_COMMENTS : "writes (user_id)"
     TICKETS ||--o{ TICKET_ACTIVITIES : "has (cascade)"
-    USERS ||--o{ TICKET_ACTIVITIES : "performs (user_id)"
+    USERS |o--o{ TICKET_ACTIVITIES : "performs (user_id, NULL = system)"
+    TICKETS ||--o{ TICKET_ATTACHMENTS : "has (restrict)"
+    TICKET_COMMENTS |o--o{ TICKET_ATTACHMENTS : "has (nullable)"
+    USERS ||--o{ TICKET_ATTACHMENTS : "uploads (uploaded_by)"
     USERS ||--o{ NOTIFICATIONS : "notifiable (polymorphic, no FK)"
     USERS |o--o{ SESSIONS : "user_id (index only)"
 
@@ -841,6 +1215,7 @@ erDiagram
         varchar email UK
         varchar password "bcrypt hash"
         varchar role "admin agent customer, indexed"
+        bigint client_id FK "clients.id, nullable, restrict"
         tinyint is_active "default 1"
         varchar remember_token "nullable"
         timestamp created_at
@@ -856,19 +1231,63 @@ erDiagram
         timestamp updated_at
     }
 
+    PROJECTS {
+        bigint id PK
+        varchar name
+        varchar code UK "HRMS"
+        text description "nullable"
+        tinyint is_active "default 1"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    CLIENTS {
+        bigint id PK
+        varchar name
+        varchar code UK "ACME"
+        varchar email "nullable"
+        varchar phone "nullable"
+        varchar address "nullable"
+        text description "nullable"
+        tinyint is_active "default 1"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    CLIENT_PROJECT {
+        bigint id PK
+        bigint client_id FK "restrict, indexed"
+        bigint project_id FK "restrict"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    PROJECT_USER {
+        bigint id PK
+        bigint project_id FK "restrict"
+        bigint user_id FK "restrict, indexed"
+        timestamp created_at
+        timestamp updated_at
+    }
+
     TICKETS {
         bigint id PK
         varchar ticket_number UK "nullable, TK-000001"
         varchar subject
         text description
         bigint category_id FK "restrict"
+        bigint project_id FK "nullable, restrict"
+        bigint client_id FK "nullable, restrict"
         bigint created_by FK "users.id, restrict"
         bigint assigned_to FK "users.id, nullable, restrict"
         varchar priority "indexed"
         varchar status "indexed"
         datetime due_at "SLA deadline, indexed"
         datetime resolved_at "nullable"
+        datetime sla_notified_at "nullable"
         text resolution_note "nullable"
+        int version "default 1"
+        varchar request_token "nullable, UK with created_by"
         timestamp created_at "indexed"
         timestamp updated_at
     }
@@ -878,17 +1297,32 @@ erDiagram
         bigint ticket_id FK "cascade"
         bigint user_id FK "restrict"
         text message
-        timestamp created_at
+        varchar visibility "public or internal"
+        timestamp created_at "indexed with ticket_id"
         timestamp updated_at
     }
 
     TICKET_ACTIVITIES {
         bigint id PK
         bigint ticket_id FK "cascade"
-        bigint user_id FK "restrict"
+        bigint user_id FK "nullable = system, restrict"
         varchar action
         text old_value "nullable"
         text new_value "nullable"
+        tinyint is_internal "default 0"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    TICKET_ATTACHMENTS {
+        bigint id PK
+        bigint ticket_id FK "restrict"
+        bigint ticket_comment_id FK "nullable, restrict"
+        bigint uploaded_by FK "users.id, restrict"
+        varchar original_name
+        varchar storage_path "private disk"
+        varchar mime_type
+        bigint size "bytes"
         timestamp created_at
         timestamp updated_at
     }
@@ -897,7 +1331,7 @@ erDiagram
         char id PK "uuid"
         varchar type
         varchar notifiable_type "App Models User"
-        bigint notifiable_id "indexed with type"
+        bigint notifiable_id "index with type and created_at"
         text data "JSON"
         timestamp read_at "nullable"
         timestamp created_at
@@ -946,7 +1380,8 @@ erDiagram
     }
 ```
 
-`CACHE`, `CACHE_LOCKS`, `JOBS` and `FAILED_JOBS` have no relationships to the business tables.
+`CACHE`, `CACHE_LOCKS`, `JOBS` and `FAILED_JOBS` have no relationships to the business tables
+(`CACHE_LOCKS` holds the V2 assignment lock and the scheduler's overlap lock).
 
 ---
 
@@ -960,6 +1395,14 @@ erDiagram
 4. Error 1451 when deleting → a RESTRICT foreign key is protecting history (expected).
 5. Error 1062 "Duplicate entry" → a UNIQUE index was violated (email, category name, ticket number).
 6. "Unknown column 'creator_id'" → a relationship lost its explicit foreign key argument.
+7. V2: error 1052 "Column 'id' in where clause is ambiguous" → a `belongsToMany` query used `id` instead of
+   `users.id` / `clients.id` / `projects.id` (the pivot JOIN brings a second `id`).
+8. V2: "Integrity constraint violation ... created_by_request_token_unique" in the log → a duplicate form submit;
+   `TicketService::createTicket()` catches it and returns the existing ticket.
+9. V2: `migrate:rollback` of `000006` fails with "Data truncated / cannot be null" → system activities
+   (`user_id IS NULL`) exist; see [22 — section 14](22-V2-BUSINESS-FEATURES.md#14-migration-and-rollback-implications).
+10. V2: `SHOW INDEX FROM tickets` no longer shows `tickets_created_by_foreign` — expected, the foreign key now uses
+    `tickets_created_by_request_token_unique`.
 
 **Adding a column (example: `tickets.source` = phone/email/web)**
 

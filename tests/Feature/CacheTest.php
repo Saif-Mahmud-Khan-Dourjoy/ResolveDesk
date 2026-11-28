@@ -8,6 +8,7 @@ use App\Models\User;
 use App\Services\TicketService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
@@ -52,6 +53,7 @@ class CacheTest extends TestCase
         $this->assertSame(0, Cache::get(TicketService::DASHBOARD_CACHE_KEY)['total']);
 
         $this->actingAs($admin)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'New', 'description' => 'New', 'category_id' => $category->id, 'priority' => 'low',
         ]);
         $this->assertFalse(Cache::has(TicketService::DASHBOARD_CACHE_KEY), 'cache was forgotten');
@@ -125,6 +127,7 @@ class CacheTest extends TestCase
         Cache::put(Category::ACTIVE_CACHE_KEY, Category::all(['id', 'name'])->toArray(), 3600);
 
         $this->actingAs($customer)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'x', 'description' => 'x', 'category_id' => $category->id, 'priority' => 'low',
         ])->assertSessionHasErrors('category_id');
     }

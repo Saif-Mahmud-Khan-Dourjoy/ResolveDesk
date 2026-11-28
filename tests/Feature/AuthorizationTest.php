@@ -89,6 +89,7 @@ class AuthorizationTest extends TestCase
         $this->actingAs($customer)->get(route('tickets.edit', $assignedTicket))->assertForbidden();
         $this->actingAs($customer)
             ->put(route('tickets.update', $assignedTicket), [
+                'version' => $assignedTicket->fresh()->version,
                 'subject' => 'Changed', 'description' => 'x', 'category_id' => $assignedTicket->category_id, 'priority' => 'low',
             ])
             ->assertForbidden();

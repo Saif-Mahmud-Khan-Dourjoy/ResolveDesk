@@ -6,14 +6,21 @@ Practical questions an interviewer may ask, answered for **this** project. Every
 2. **In ResolveDesk:** a real example (file + snippet or method name) so you can prove you know your own code.
 
 Difficult ideas also have a **বাংলায়** block. Tricky follow-up questions are collected in
-[Part 5](#part-5--tricky-follow-up-questions).
+[Part 5](#part-5--tricky-follow-up-questions). **V2 questions** (concurrency, idempotency, WebSockets/Reverb,
+scheduler, cache locks, attachments, multi-tenant isolation, rate limiting, deployment) are in
+[Part 6](#part-6--v2-questions-multi-project-production-upgrade).
 
 Related: [Live coding practice](08-LIVE-CODING-PRACTICE.md) · [System design guide](10-SYSTEM-DESIGN-GUIDE.md) ·
-[Business logic](06-BUSINESS-LOGIC-GUIDE.md) · [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md)
+[Business logic](06-BUSINESS-LOGIC-GUIDE.md) · [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) ·
+[Concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md) · [Real-time](21-REALTIME-REVERB-ECHO.md) ·
+[V2 features](22-V2-BUSINESS-FEATURES.md) · [Security/ops](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md) ·
+[Deployment](18-PRODUCTION-DEPLOYMENT.md)
 
-> Implemented vs. future: everything under "In ResolveDesk" is implemented. Redis, WebSockets (Reverb/Pusher),
-> load balancers, read replicas and scheduled SLA escalation are **not** implemented — they are only discussed as
-> future options.
+> Implemented vs. future (V2): everything under "In ResolveDesk" is implemented. **Implemented in V2:** WebSockets with
+> Laravel Reverb (plus polling fallback), the scheduled SLA breach reminder, optimistic locking, idempotent creation,
+> atomic cache locks, rate limiting. **Not implemented** (future only): Redis, load balancers, multiple app servers,
+> read replicas, object storage, Reverb horizontal scaling. Parts 1–5 were written for V1; where V2 changed an answer,
+> a **V2:** note says so.
 
 ---
 
@@ -271,7 +278,7 @@ exception handler, which turns known types into HTTP responses (404, 403, 422...
 - Business rule failure: `throw ValidationException::withMessages(['ticket' => 'This action is not allowed while the ticket is Closed.']);`
   (`TicketService::ensureActionAllowed()`) → redirect back with the message.
 - An exception inside `DB::transaction()` rolls the transaction back and is re-thrown.
-- `try { SendTicketEmail::dispatch(...); } catch (Throwable $exception) { Log::error(...); }` in `queueEmail()` — a
+- `try { SendTicketEmail::dispatch(...); } catch (Throwable $exception) { Log::error(...); }` in `TicketNotifier::queueEmail()` — a
   queue problem must not show an error for a ticket change that is already committed.
 - `firstOrFail()` / `findOrFail()` throw `ModelNotFoundException` → 404. `Gate::authorize()` throws
   `AuthorizationException` → 403. `abort(403, ...)` in `RoleMiddleware`.
@@ -286,8 +293,8 @@ is passed. `?Type` means "Type or null"; `void` means "returns nothing".
 **In ResolveDesk:**
 
 ```php
-    public function autoAssign(Ticket $ticket, User $admin): ?User                 // returns an agent or null
-    private function recordActivity(Ticket $ticket, User $user, string $action, ?string $oldValue, ?string $newValue): void
+    public function autoAssign(Ticket $ticket, User $admin, ?int $expectedVersion = null): ?User   // TicketAssignmentService: agent or null
+    public static function record(Ticket $ticket, ?User $user, string $action, ?string $oldValue, ?string $newValue, bool $isInternal = false): self   // TicketActivity
     public function handle(Request $request, Closure $next, string ...$roles): Response   // variadic in RoleMiddleware
     public int $tries = 3;                                                           // typed property in SendTicketEmail
 ```
@@ -851,7 +858,7 @@ worker, 2 jobs waited in `jobs`; `queue:work --stop-when-empty` sent both to the
 **Answer:** Producers put messages into a buffer; consumers take them out and process them, independently and at their
 own speed.
 
-**In ResolveDesk:** producer = `TicketService::queueEmail()` → `SendTicketEmail::dispatch(...)` inserts a row into
+**In ResolveDesk:** producer = `TicketNotifier::queueEmail()` → `SendTicketEmail::dispatch(...)` inserts a row into
 `jobs`; buffer = the `jobs` table; consumer = `php artisan queue:work` calling `SendTicketEmail::handle()`. You can run
 several workers (consumers) for more throughput.
 
@@ -874,12 +881,12 @@ de-duplicated with `shownToastIds` (a `Set`). On 401/419 it stops and shows "Sig
 **Q: What are WebSockets and do you use them?**
 
 **Answer:** A persistent two-way connection, so the server can **push** a message instantly. Laravel supports this via
-broadcasting (Reverb, Pusher). **Not implemented** in ResolveDesk.
+broadcasting (Reverb, Pusher). **V2: implemented with Laravel Reverb.**
 
-**In ResolveDesk:** polling was chosen because it needs no extra server process, works on any shared host/XAMPP and is
-easy to debug; a delay of a few seconds is acceptable for ticket notifications. Moving to WebSockets later would mean:
-a broadcasting server, a `ShouldBroadcast` notification channel, private channel authorization, and JS listening
-instead of polling. See 5.5.
+**In ResolveDesk (V2):** `TicketNotifier` broadcasts `UserNotificationCreated` (`ShouldBroadcastNow`) after the commit on
+the private channel `users.{id}`; `resources/js/realtime.js` (Laravel Echo) listens for `.notification.created` and
+tells `public/js/notifications.js` to fetch the feed. Polling remains as the fallback when the socket is not healthy.
+V1 used polling only (see 5.5 for the original trade-off). Details in Part 6 (6.5–6.8).
 
 ### 4.8 Load balancing
 
@@ -890,8 +897,9 @@ important state locally. **Not implemented** — this is a design discussion.
 
 **In ResolveDesk:** it is already fairly ready: sessions (`SESSION_DRIVER=database`), cache (`CACHE_STORE=database`)
 and the queue (`QUEUE_CONNECTION=database`) all live in the shared database, so any server can handle any request.
-Remaining items: shared `APP_KEY`, central logs instead of `storage/logs/laravel.log` per server, and file storage if
-uploads were added.
+Remaining items: shared `APP_KEY`, central logs instead of `storage/logs/laravel.log` per server, shared file storage
+for V2 attachments (they are on the local private disk), Reverb scaling across servers, and `onOneServer()` for the
+scheduler. See Part 6.18.
 
 ### 4.9 Horizontal scaling
 
@@ -901,7 +909,8 @@ uploads were added.
 
 **In ResolveDesk:** web servers and queue workers can be multiplied (workers safely share the `jobs` table — a job is
 reserved by one worker). The bottleneck then becomes the single database (sessions, cache, queue, polling queries all
-hit it). Future steps: Redis for cache/sessions/queue, read replicas for reports, and WebSockets to remove polling load.
+hit it). Future steps: Redis for cache/sessions/queue/locks, read replicas for reports. (V2 already replaced most
+polling with Reverb push.)
 
 ### 4.10 Database optimization
 
@@ -943,7 +952,9 @@ retries or double-clicks happen.
 - `markAsRead` / `markAllAsRead` are naturally idempotent.
 - Toasts: `shownToastIds` prevents showing one notification twice.
 - **Not** idempotent: sending an email. A retry after an unclear SMTP failure can send a duplicate — accepted for
-  notification emails.
+  notification emails. **V2:** a `ticket-email-sent:{notification id}` cache key now skips a resend after a successful
+  attempt (best effort).
+- **V2:** ticket creation is idempotent through `request_token` (Part 6.3).
 
 > **বাংলায়:** Idempotent কাজ একবার করলে যা হয়, দুবার করলেও তাই হয়। একই agent-কে আবার assign করলে ResolveDesk কিছুই
 > বদলায় না — নতুন activity বা notification তৈরি হয় না। কিন্তু ইমেইল পাঠানো idempotent নয়; retry হলে ডুপ্লিকেট
@@ -991,7 +1002,7 @@ several NULLs), and the unique index is the final safety net.
 describe a change that never happened. Also, a fast worker could pick up the job **before** the commit and not see the
 data yet.
 
-**In ResolveDesk:** `TicketService::queueEmail()` registers the dispatch with `DB::afterCommit()`. On rollback the
+**In ResolveDesk:** `TicketNotifier::queueEmail()` registers the dispatch with `DB::afterCommit()`. On rollback the
 callback is discarded → no job (`test_no_email_job_is_dispatched_when_the_transaction_rolls_back`). The dispatch is
 wrapped in `try/catch (Throwable)` + `Log::error()`: the ticket change is already committed, so a queue failure must not
 show the user a false error (`test_email_failure_does_not_reverse_the_committed_assignment`). Alternatives Laravel
@@ -1003,7 +1014,7 @@ the explicit call makes the intent visible).
 
 ### 5.3 "What if two admins assign the same ticket at the same time?"
 
-**Answer:** Both requests enter `TicketService::assignAgent()`. Each opens a transaction and calls `lockTicket()`:
+**Answer:** Both requests enter `TicketAssignmentService::assignAgent()`. Each opens a transaction and calls `lockTicket()`:
 
 ```php
         return Ticket::whereKey($ticket->id)->lockForUpdate()->firstOrFail();
@@ -1018,6 +1029,10 @@ row (status Assigned, `assigned_to` = A's agent):
 
 There is never a lost update or two "assigned" activities. Note the policy check in the controller used the
 (possibly stale) route-bound model — that is why the service re-checks the rules on the locked row.
+
+**V2:** assignment now lives in `TicketAssignmentService` and adds two layers before the row lock: the global
+`Cache::lock('ticket-assignment')` (B waits up to 5 s) and a shared lock on the project row; B's form also sends the
+`version` it saw, so a stale form is rejected with a conflict. See Part 6.1–6.2.
 
 > **বাংলায়:** `lockForUpdate()` টিকিটের row-টিকে transaction শেষ না হওয়া পর্যন্ত তালাবদ্ধ রাখে। দ্বিতীয় admin-এর
 > request অপেক্ষা করে, তারপর আপডেট হওয়া ডেটা পড়ে সিদ্ধান্ত নেয়। ফলে দুজন একসাথে বদলালেও ডেটা নষ্ট হয় না।
@@ -1057,7 +1072,10 @@ always-on server (e.g. Laravel Reverb), channel authorization and more operation
 
 **In ResolveDesk:** polling every 5 s (30 s when hidden) with `?since=` so no notification is missed, overlap prevention
 (`isRequestRunning`, recursive `setTimeout`), toast de-duplication by ID, and stop on 401/419. Load estimate for the
-interview: 500 active tabs ÷ 5 s = 100 small requests/second — at that point WebSockets (not implemented) become worth it.
+interview: 500 active tabs ÷ 5 s = 100 small requests/second — at that point WebSockets become worth it.
+
+**V2:** that is exactly what happened — Reverb push was added, and polling now runs only while the WebSocket is not
+healthy. The V1 reasoning is still a good interview answer for *why polling stays as the fallback*.
 
 ### 5.6 "Why DATETIME instead of TIMESTAMP for `due_at` and `resolved_at`?"
 
@@ -1137,7 +1155,7 @@ external server — slow and unreliable — so it is queued, retried and sent af
 even if the ticket changes again before the worker runs. It also avoids a database read in the worker and problems if
 the model changes shape.
 
-**In ResolveDesk:** `queueEmail()` copies `ticket_id`, `ticket_number`, `subject`, `status`, `event_title`,
+**In ResolveDesk:** `TicketNotifier::queueEmail()` copies `ticket_id`, `ticket_number`, `subject`, `status`, `event_title`,
 `event_message` into `$emailData`; `SendTicketEmail::__construct(public string $recipientEmail, public string $recipientName, public array $emailData)`.
 
 ### 5.13 "What happens if the queue worker is down?"
@@ -1192,11 +1210,11 @@ return numbers as strings; without the cast `"5" === 5` is `false` and the real 
 ### 5.21 "What are the known limitations / what would you improve?"
 
 Be honest — interviewers like this:
-- `TicketService::updateTicket()` does not lock the ticket like the transition methods do, so an edit racing with an
-  assignment is possible (low impact: `save()` writes only the changed columns, never status or assignee).
+- ~~`updateTicket()` has no lock~~ — **fixed in V2** with optimistic locking (`version`, conditional UPDATE, 409).
 - SLA uses continuous calendar hours (no business hours, no pause while waiting for the customer).
-- Polling costs requests; WebSockets would scale better (not implemented).
-- Emails are not idempotent (a retry can duplicate an email).
+- V2 limitations: single Reverb server (no Redis scaling), global assignment lock (one assignment at a time),
+  timestamps stored in `Asia/Dhaka` not UTC, no antivirus scanning of attachments.
+- Emails are at-least-once; the V2 cache key reduces but cannot eliminate duplicates.
 - Developed and verified on MariaDB 10.4 (XAMPP), while the target is MySQL 8; the only DB-specific SQL is
   `TIMESTAMPDIFF` and `DATE()` in `DashboardController`, which both support.
 - Not verified: rendering in a real browser, the JS toast in a browser, real Gmail SMTP delivery (see
@@ -1217,3 +1235,259 @@ Be honest — interviewers like this:
 8. What does `lockForUpdate()` protect against? Give the two-admins scenario.
 9. Why is overdue computed and not stored?
 10. Why DATETIME for `due_at`?
+
+---
+
+## Part 6 — V2 questions (multi-project production upgrade)
+
+Format as above: **short answer**, then **In ResolveDesk** with the real file or method.
+
+### 6.1 Race conditions and pessimistic locking
+
+**Q: What is a race condition, and how do you prevent it for ticket transitions?**
+
+**Answer:** Two requests read the same data, both decide based on it, and the second overwrites or duplicates the
+first. Pessimistic locking prevents it by locking the row while you decide.
+
+**In ResolveDesk:** every transition runs `DB::transaction(function () { $locked = $this->lockTicket($ticket); ... }, 3)`.
+`lockTicket()` = `Ticket::whereKey($id)->lockForUpdate()->firstOrFail()` → `SELECT ... FOR UPDATE`. A double-clicked
+Resolve: the second request waits, then sees status Resolved and `ensureActionAllowed('resolve')` fails — one activity,
+one notification (`ConsistencyTest::test_double_submitted_resolve_creates_one_activity_and_one_notification`).
+`MySqlConcurrencyTest::test_row_lock_blocks_a_second_connection_until_commit` proves the wait with two real connections.
+
+### 6.2 Optimistic locking
+
+**Q: What is optimistic locking and when do you prefer it?**
+
+**Answer:** Don't lock while the user thinks; instead remember a version number and update only if it is unchanged.
+Good for edit forms that stay open for minutes.
+
+**In ResolveDesk:** `tickets.version` (default 1, +1 on every mutation). The edit form posts `version`;
+`TicketService::updateTicket()` executes
+`UPDATE tickets SET ..., version = version + 1 WHERE id = ? AND version = ? AND status <> 'closed'`.
+`0` rows → `TicketConflictException::staleVersion()` → 409 for JSON, redirect back with input for forms.
+Transitions and assignment call `Ticket::ensureVersion($expectedVersion)` on the locked row (version optional there).
+
+> **বাংলায়:** Pessimistic locking = আগে তালা, তারপর কাজ (অন্যরা অপেক্ষা করে)। Optimistic locking = তালা নেই, কিন্তু
+> সেভ করার সময় দেখা হয় "আমি যে version দেখেছিলাম সেটা এখনো আছে কি না"; না থাকলে রিজেক্ট। লম্বা সময় খোলা ফর্মের
+> জন্য optimistic ভালো, ছোট দ্রুত অপারেশনের জন্য pessimistic।
+
+### 6.3 Idempotency for ticket creation
+
+**Q: A user double-clicks "Create Ticket" on a slow network. What happens?**
+
+**Answer:** Use an idempotency key: the same key must always produce the same result, never a second record.
+
+**In ResolveDesk:** `TicketController::create()` renders a hidden `request_token` (UUID). `TicketService::createTicket()`:
+(1) `findByRequestToken()` — existing ticket? → `replayOrReject()`; (2) otherwise insert; a parallel duplicate hits the
+unique index `(created_by, request_token)` → `UniqueConstraintViolationException` is caught → replay. Same content →
+same ticket returned ("This form was already submitted"); different content → 409. Verified: 6 parallel PHP processes
+with one token → 1 ticket, 1 activity, 5 replays.
+
+**Follow-up:** "Why not only check first?" — check-then-insert is itself a race; only the database unique index is atomic.
+
+### 6.4 Atomic cache locks
+
+**Q: Why did you need `Cache::lock()` when you already lock rows?**
+
+**Answer:** Row locks protect one row. Some decisions depend on *many* rows (the workload of all agents).
+
+**In ResolveDesk:** two auto-assigns of **different** tickets both count workload and would pick the same "least busy"
+agent. `TicketAssignmentService::withAssignmentLock()` wraps assignment in
+`Cache::lock('ticket-assignment', 10)->block(5, ...)` (database store → `cache_locks` table). Timeout → "Another
+assignment is being processed right now". The lock expires after 10 s if PHP crashes, so it is coordination; the row
+lock and version checks remain the guarantee. Verified: 4 parallel auto-assigns gave exactly the sequential result.
+
+### 6.5 Deadlocks
+
+**Q: How do you avoid and handle deadlocks?**
+
+**Answer:** Always take locks in the same order; keep transactions short; retry when the database reports a deadlock.
+
+**In ResolveDesk:** lock order is **cache lock → project row (shared) → ticket row (exclusive) → agent's users row (exclusive, assignment only)** everywhere
+(`lockProjectAndTicket()`, `resolveScope()` uses `sharedLock()`, `ProjectService` uses `lockForUpdate()` on the project).
+`DB::transaction($callback, 3)` retries up to 3 times on deadlock (MySQL error 1213). No network calls inside
+transactions: broadcasts and emails run after commit, and during assignment are held until the cache lock is released.
+
+### 6.6 WebSockets and Reverb
+
+**Q: How do real-time notifications work in your project?**
+
+**Answer:** The server pushes a small event over a persistent WebSocket; the browser reacts without polling.
+
+**In ResolveDesk:** `php artisan reverb:start` runs the WebSocket server (Pusher protocol, port 8080).
+`TicketNotifier::notify()` inserts the notification, then **after commit** calls
+`event(new UserNotificationCreated($userId, $notificationId))`. The event implements `ShouldBroadcastNow`, broadcasts on
+`PrivateChannel('users.'.$userId)` as `notification.created` with payload `['notification_id' => ...]`.
+`resources/js/realtime.js` (Echo) listens with `.listen('.notification.created', ...)` and dispatches a browser event;
+`notifications.js` fetches `/notifications/feed` and shows the toast. Verified with a Node pusher-js client: 255 ms.
+
+### 6.7 Private channel authorization
+
+**Q: How do you stop user A from listening to user B's notifications?**
+
+**Answer:** Private channels require server-side authorization before subscription.
+
+**In ResolveDesk:** Echo calls `POST /broadcasting/auth` with the session cookie and CSRF token. `routes/channels.php`:
+`Broadcast::channel('users.{userId}', fn (User $user, $userId) => $user->id === (int) $userId && $user->is_active)`.
+False → 403. Also, only the notification **id** travels over the socket; the content comes from the authorized feed,
+so even a leaked event reveals nothing.
+
+### 6.8 Why broadcast after commit, and why `ShouldBroadcastNow`?
+
+**Answer:** After commit, so a rolled-back change never shows a toast. "Now" (not queued) so real-time does not depend on
+the queue worker.
+
+**In ResolveDesk:** `TicketNotifier::afterCommit()` uses `DB::afterCommit()`; the broadcast is wrapped in try/catch and
+logs a warning if Reverb is down. Broadcaster timeouts are short (connect 2 s, total 3 s in `config/broadcasting.php`).
+Tests: `test_no_broadcast_and_no_email_when_the_transaction_rolls_back`, `test_failed_broadcast_does_not_break_the_operation`.
+
+### 6.9 Graceful degradation
+
+**Q: What happens when Reverb, the worker or the scheduler is down?**
+
+**Answer / In ResolveDesk:** the core operation still succeeds. Reverb down → polling every 5 s; worker down → emails wait
+in `jobs`; scheduler down → reminders at the next run (still once, thanks to `sla_notified_at`); `npm run build` missing
+→ the layout skips `@vite`, polling only. The database notification is always the source of truth.
+
+### 6.10 Scheduler
+
+**Q: How does the Laravel scheduler work, and how do you avoid duplicate reminders?**
+
+**Answer:** One cron entry runs `php artisan schedule:run` every minute; Laravel decides which tasks are due.
+
+**In ResolveDesk:** `routes/console.php`: `Schedule::command('tickets:check-sla')->everyMinute()->withoutOverlapping()`.
+`CheckSlaBreaches` selects `Ticket::overdue()->whereNull('sla_notified_at')`, walks them with `chunkById(100)` and calls
+`TicketService::processSlaBreach()`, which locks the row, re-checks, sets `sla_notified_at` and notifies — so even two
+overlapping runs (or two servers) send one reminder. Locally: `php artisan schedule:work`.
+`onOneServer()` is not used (single server); with several servers it would need a shared cache.
+
+### 6.11 Producer–consumer with retries and timeouts (V2 details)
+
+**Q: How did you make the email job safer in V2?**
+
+**In ResolveDesk:** `SendTicketEmail`: `$tries = 3`, `$backoff = 10`, **`$timeout = 60`** (< `retry_after = 90` in
+`config/queue.php`, otherwise a second worker could start the same job while the first is still running — tested by
+`test_worker_timeout_is_shorter_than_retry_after`). The job carries a `delivery_key` (the notification UUID) and stores
+`ticket-email-sent:{key}` for 2 days after sending, so a retry skips a sent email. Dispatched only after commit.
+
+### 6.12 Secure file uploads
+
+**Q: How do you handle file uploads securely?**
+
+**Answer:** Validate type and size on the server, store outside the public web root with generated names, and serve
+downloads through an authorization check.
+
+**In ResolveDesk:** `AttachmentService::validationRules()` — max 5 files, 5 MB each, `extensions:` **and** `mimes:` for
+`pdf, png, jpg, jpeg, txt, docx, xlsx` (`config/resolvedesk.php`). Stored on the private `local` disk under
+`ticket-attachments/YYYY/MM/<uuid>.<ext>` — the original name is only metadata. Files are written **before** the
+transaction and deleted if it fails (a transaction cannot undo a file). `TicketAttachmentController::download()` →
+`Gate::authorize('downloadAttachment', [$ticket, $attachment])` (attachment must belong to the ticket, user must view the
+ticket, internal-note files staff-only) → `download()` with `Content-Disposition: attachment` and
+`X-Content-Type-Options: nosniff`. Not implemented: antivirus scanning.
+
+### 6.13 Multi-tenant / client data isolation
+
+**Q: Is this multi-tenant? How do you isolate clients?**
+
+**Answer:** It is logically multi-tenant in a single database: every query and action is scoped by the user's identity,
+not by separate databases.
+
+**In ResolveDesk:** the customer's `client_id` always comes from `users.client_id` (form input ignored) in
+`TicketService::resolveScope()`; the project must be linked to that client (`client_project`); `Ticket::scopeVisibleTo()`
+restricts lists to created/assigned tickets; `TicketPolicy::view()` protects details; internal notes and activities are
+removed in SQL by `visibleTo()` scopes; attachments and broadcast channels are authorized; the dependent dropdown endpoint
+returns only allowed projects. Tested in `TicketScopeTest` (17 tests).
+**Follow-up:** "Separate databases per tenant?" — stronger isolation but much more operational work; not needed here.
+
+> **বাংলায়:** Logical isolation মানে সব ক্লায়েন্টের ডাটা একই ডাটাবেসে, কিন্তু প্রতিটি query আর প্রতিটি অনুমতি-চেক
+> লগইন করা ইউজারের পরিচয় দিয়ে সীমাবদ্ধ। ফর্মে অন্য ক্লায়েন্টের id পাঠালেও সার্ভার সেটা উপেক্ষা করে।
+
+### 6.14 Project membership vs visibility
+
+**Q: Can an agent of project ERP see every ERP ticket?**
+
+**Answer / In ResolveDesk:** No. Membership (`project_user`) only decides **assignment eligibility**
+(`Ticket::canBeAssignedTo()`, `findLeastBusyAgent($projectId)`). Visibility stays "created by me or assigned to me"
+(V2 spec §6, documented decision).
+
+### 6.15 Rate limiting
+
+**Q: How and why do you rate limit?**
+
+**Answer:** To protect against abuse, accidental loops and expensive endpoints; exceeding returns 429.
+
+**In ResolveDesk:** `AppServiceProvider::configureRateLimiting()` defines named limiters used as
+`->middleware('throttle:NAME')`: `ticket-create` 10/min, `comments` 30/min, `notifications` 120/min, `exports` 5/min,
+keyed by **user id** (so colleagues behind one office IP don't block each other) or IP for guests. Login: manual
+`RateLimiter` with 5 failures per email + IP. `/health/ready`: `throttle:60,1`. Tests:
+`test_csv_export_is_rate_limited`, `test_notification_feed_is_rate_limited_per_user`.
+
+### 6.16 Logging and request tracing
+
+**Q: How do you trace one user's error in the logs?**
+
+**In ResolveDesk:** `AddRequestContext` middleware: `Log::withContext(['request_id' => ..., 'user_id' => ...])` and the
+`X-Request-Id` response header. Ask the user for the id, grep the log. Only ids are logged — no passwords or ticket text.
+Production uses the `daily` channel (14 days) — documented, local stays `single`.
+
+### 6.17 Health checks
+
+**Q: Liveness vs readiness?**
+
+**Answer:** Liveness = "the process is up"; readiness = "it can serve real traffic (dependencies reachable)".
+
+**In ResolveDesk:** `/up` (framework) for liveness; `/health/ready` runs `SELECT 1` and returns `{"status":"ok"}` or 503
+`{"status":"unavailable"}` with no details (`test_readiness_endpoint_reports_ok_without_details`).
+
+### 6.18 Deployment
+
+**Q: How would you deploy ResolveDesk to production?**
+
+**Answer (documented in [18](18-PRODUCTION-DEPLOYMENT.md), not executed):** Linux + Nginx + PHP-FPM 8.4, MySQL 8;
+`composer install --no-dev --optimize-autoloader`, `npm ci && npm run build`, `.env` with `APP_ENV=production`,
+`APP_DEBUG=false`, real `REVERB_*` secrets; `php artisan migrate --force` (additive), `config:cache`, `route:cache`,
+`view:cache`; Supervisor (or systemd) keeps `queue:work` and `reverb:start` running; one cron line runs `schedule:run`;
+Nginx terminates TLS and proxies WebSocket upgrades for WSS; `php artisan queue:restart` and a Reverb restart on each
+deploy; backups per [19](19-BACKUP-AND-RECOVERY.md).
+
+### 6.19 Scaling beyond one server (future)
+
+**Q: What changes with several app servers?**
+
+**Answer (not implemented):** load balancer in front; sessions, cache, locks and queue in a shared store (Redis, or the
+shared DB as today); attachments on shared object storage (S3 — `ATTACHMENT_DISK=s3` plus the Flysystem S3 package, no application code change); Reverb scaling
+with Redis pub/sub (`REVERB_SCALING_ENABLED`) or sticky WebSocket routing; `onOneServer()` for scheduled tasks; read
+replica for reports; centralized logs and monitoring.
+
+### 6.20 Transactions and side effects
+
+**Q: What belongs inside a transaction and what after it?**
+
+**In ResolveDesk:** inside: ticket row, activities, attachment rows, database notifications (they must roll back
+together). After commit: Reverb broadcast, email job dispatch, cache invalidation. Before the transaction: writing files
+(cleanup on failure). This keeps the database the single source of truth.
+
+### 6.21 What V2 changed in testing
+
+**Q: How did you test concurrency, which normal feature tests cannot show?**
+
+**In ResolveDesk:** feature tests run in one connection, so `MySqlConcurrencyTest` opens a second real connection
+(`mysql_second`) with `innodb_lock_wait_timeout = 1`: a held `FOR UPDATE` blocks the second connection; a parallel
+duplicate insert hits the unique token index; a stale optimistic update changes 0 rows. Manual multi-process runs are
+recorded in `DEVELOPMENT_PROGRESS.md`. Suite: 164 tests / 661 assertions.
+
+---
+
+## Quick V2 self-test
+
+1. Name the four concurrency/consistency mechanisms and one place each is used.
+2. Why does assignment need a cache lock and a row lock?
+3. What happens on double submit of the create form — with the same content, and with different content?
+4. What exactly is sent over the WebSocket and who may receive it?
+5. What happens to a ticket operation when Reverb is down?
+6. Why is the SLA reminder sent once even with overlapping scheduler runs?
+7. Three things that protect attachment downloads.
+8. Why are rate limits keyed by user id instead of IP?
+9. Which processes must run in production, and what keeps each alive?
+10. Which parts of the scaling story are implemented, and which are future?

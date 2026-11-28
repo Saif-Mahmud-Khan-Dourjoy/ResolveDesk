@@ -57,6 +57,27 @@
     </div>
 </div>
 
+@if ($user->isCustomer())
+    <div class="alert alert-light border small">
+        <i class="bi bi-building me-1"></i>
+        @if ($user->client)
+            Client organization: <a href="{{ route('clients.show', $user->client) }}">{{ $user->client->displayName() }}</a>
+            @unless ($user->client->is_active)<span class="badge bg-secondary-subtle text-secondary-emphasis">Inactive - cannot create new tickets</span>@endunless
+        @else
+            Standalone customer (no client organization) - can create global tickets only.
+        @endif
+    </div>
+@elseif ($user->isAgent())
+    <div class="alert alert-light border small">
+        <i class="bi bi-kanban me-1"></i> Supported projects:
+        @forelse ($user->projects as $project)
+            <a href="{{ route('projects.show', $project) }}" class="badge text-bg-light border text-decoration-none">{{ $project->code }}</a>
+        @empty
+            none (can only be assigned global tickets). Manage on each project's page.
+        @endforelse
+    </div>
+@endif
+
 <div class="card">
     <div class="card-header">Recent tickets created by or assigned to this user</div>
     <div class="table-responsive">

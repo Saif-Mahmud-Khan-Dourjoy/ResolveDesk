@@ -3,7 +3,10 @@
 namespace App\Http\Controllers;
 
 use App\Models\Category;
+use App\Models\Client;
+use App\Models\Project;
 use App\Models\Ticket;
+use App\Models\TicketActivity;
 use App\Models\User;
 use App\Services\TicketService;
 use Illuminate\Http\Request;
@@ -71,11 +74,18 @@ class DashboardController extends Controller
             ->orderBy('name')
             ->get();
 
+        // V2: latest audit-trail entries (admins may see internal ones too). Not cached.
+        $recentActivity = TicketActivity::with(['user', 'ticket:id,ticket_number'])
+            ->latest('id')
+            ->take(10)
+            ->get();
+
         return view('dashboard.admin', [
             'stats' => $stats,
             'overdueCount' => $overdueCount,
             'recentTickets' => $recentTickets,
             'agentWorkload' => $agentWorkload,
+            'recentActivity' => $recentActivity,
         ]);
     }
 
@@ -132,8 +142,45 @@ class DashboardController extends Controller
 
         $averageResolutionHours = $averageMinutes !== null ? round($averageMinutes / 60, 1) : null;
 
+        // ---- V2 statistics ----------------------------------------------------
+        // Global = no project. SELECT COUNT(*) FROM tickets WHERE project_id IS NULL
+        $globalCount = Ticket::whereNull('project_id')->count();
+
+        // Project code => tickets (GROUP BY project_id, joined to get the code).
+        $projectCounts = Ticket::join('projects', 'projects.id', '=', 'tickets.project_id')
+            ->select('projects.code', DB::raw('COUNT(*) AS total'))
+            ->groupBy('projects.code')
+            ->orderByDesc('total')
+            ->pluck('total', 'code')
+            ->map(fn ($total) => (int) $total)
+            ->toArray();
+
+        // Client code => tickets, plus "Internal" for tickets without a client.
+        $clientCounts = Ticket::join('clients', 'clients.id', '=', 'tickets.client_id')
+            ->select('clients.code', DB::raw('COUNT(*) AS total'))
+            ->groupBy('clients.code')
+            ->orderByDesc('total')
+            ->pluck('total', 'code')
+            ->map(fn ($total) => (int) $total)
+            ->toArray();
+        $clientCounts['Internal'] = Ticket::whereNull('client_id')->count();
+
+        // SLA compliance depends only on resolved tickets (resolved_at vs due_at), so it is
+        // safe to cache. The live "overdue" number is calculated outside the cache.
+        $slaSummary = Ticket::slaSummary(Ticket::query());
+
         return [
             'total' => array_sum($statusCounts),
+            'global_count' => $globalCount,
+            'project_ticket_count' => array_sum($statusCounts) - $globalCount,
+            'project_counts' => $projectCounts,
+            'client_counts' => $clientCounts,
+            'sla_compliance' => $slaSummary['sla_compliance'],
+            'resolved_within_sla' => $slaSummary['resolved_within_sla'],
+            'resolved_after_sla' => $slaSummary['resolved_after_sla'],
+            'active_projects' => Project::where('is_active', true)->count(),
+            'active_clients' => Client::where('is_active', true)->count(),
+            'active_agents' => User::where('role', User::ROLE_AGENT)->where('is_active', true)->count(),
             'status_counts' => $statusCounts,
             'priority_counts' => $priorityCounts,
             'category_counts' => $categoryCounts,
@@ -171,10 +218,21 @@ class DashboardController extends Controller
             ->take(5)
             ->get();
 
+        // V2: current workload (same definition as auto-assignment) and recent activity
+        // on tickets the agent is allowed to see (created by or assigned to them).
+        $counts['workload'] = $counts['pending'] + $counts['in_progress'];
+
+        $recentActivity = TicketActivity::with(['user', 'ticket:id,ticket_number'])
+            ->whereIn('ticket_id', Ticket::visibleTo($agent)->select('id'))
+            ->latest('id')
+            ->take(8)
+            ->get();
+
         return view('dashboard.agent', [
             'counts' => $counts,
             'recentTickets' => $recentTickets,
             'overdueTickets' => $overdueTickets,
+            'recentActivity' => $recentActivity,
         ]);
     }
 
@@ -189,6 +247,7 @@ class DashboardController extends Controller
             'active' => Ticket::where('created_by', $customer->id)->whereIn('status', Ticket::ACTIVE_STATUSES)->count(),
             'resolved' => Ticket::where('created_by', $customer->id)->where('status', Ticket::STATUS_RESOLVED)->count(),
             'closed' => Ticket::where('created_by', $customer->id)->where('status', Ticket::STATUS_CLOSED)->count(),
+            'overdue' => Ticket::where('created_by', $customer->id)->overdue()->count(),
         ];
 
         // "Recent ticket updates" = the customer's tickets that changed most recently.
@@ -201,6 +260,8 @@ class DashboardController extends Controller
         return view('dashboard.customer', [
             'counts' => $counts,
             'recentTickets' => $recentTickets,
+            // V2: the customer's own latest notifications (never anyone else's).
+            'recentNotifications' => $customer->notifications()->latest()->take(5)->get(),
         ]);
     }
 }

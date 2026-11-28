@@ -1,10 +1,12 @@
-# 02 — Setup Guide (Windows)
+# 02 — Setup Guide (Windows, V2)
 
-This guide explains how to install and run ResolveDesk on **this** Windows PC, and what every important
+This guide explains how to install and run ResolveDesk V2 on **this** Windows PC, and what every important
 command actually does. It matches the real environment recorded in `DEVELOPMENT_PROGRESS.md`.
 
 Related: [Project overview](01-PROJECT-OVERVIEW.md) · [Database guide](03-DATABASE-GUIDE.md) ·
-[Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) · [Caching](15-CACHING-GUIDE.md) · [Debugging](11-DEBUGGING-GUIDE.md)
+[Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) · [Caching](15-CACHING-GUIDE.md) · [Debugging](11-DEBUGGING-GUIDE.md) ·
+[Real-time: Reverb and Echo](21-REALTIME-REVERB-ECHO.md) · [Production deployment](18-PRODUCTION-DEPLOYMENT.md) ·
+[Backup and recovery](19-BACKUP-AND-RECOVERY.md)
 
 ---
 
@@ -12,363 +14,267 @@ Related: [Project overview](01-PROJECT-OVERVIEW.md) · [Database guide](03-DATAB
 
 | Software | Version used here | Notes |
 |---|---|---|
-| Windows | 10 Pro | All commands below are for PowerShell or Git Bash. |
+| Windows | 10 Pro | Commands below are for PowerShell or Git Bash. |
 | PHP | **8.4.28** at `C:\php-8.4.28\php.exe` | Loaded ini file: `C:\php-8.4.28\php.ini`. |
 | Composer | 2.8.8 | Must run **on PHP 8.4.28**. |
-| Laravel | 13.44.1 | Installed by Composer into `vendor/` (requirement `^13.0`). |
-| Database | **MariaDB 10.4.27** (XAMPP) | MySQL 8.x also works — the code only uses standard SQL plus `TIMESTAMPDIFF` and `DATE()`, which both support. |
+| Laravel | 13.44.1 | Installed by Composer into `vendor/`. |
+| Database | **MariaDB 10.4.27** (XAMPP) | The target is MySQL 8.x, but only MariaDB 10.4 was available and tested. |
+| Node.js / npm | v20.19.5 / 10.8.2 | **V2: needed only to build the real-time bundle** (`resources/js/realtime.js`). Without the build the app still works and uses polling. |
 | Web browser | any modern browser | Bootstrap, Bootstrap Icons and Chart.js are already in `public/vendor/`. |
-| Node.js / npm | **not needed** | The layouts load CSS/JS with `asset(...)` from `public/`, not through Vite. |
 
-Required PHP extensions (enable them in `C:\php-8.4.28\php.ini` if missing): `pdo_mysql`, `mbstring`,
-`openssl`, `fileinfo`, `curl`. Check with:
+Required PHP extensions (enable in `C:\php-8.4.28\php.ini` if missing): `pdo_mysql`, `mbstring`, `openssl`,
+`fileinfo` (needed for attachment MIME detection), `curl`. Check with `C:\php-8.4.28\php.exe -m`.
 
-```powershell
-C:\php-8.4.28\php.exe -m
-```
+## 2. PHP 8.4 and multiple PHP versions
 
-## 2. PHP 8.4 configuration and multiple PHP versions
-
-This PC has **two PHP versions**:
-
-- An **older PHP** on the global Windows PATH (used by other projects).
-- **PHP 8.4.28** in `C:\php-8.4.28` (used by ResolveDesk).
-
-If you just type `php`, Windows uses the **first** `php.exe` it finds on PATH — the old one. ResolveDesk needs
-8.4 (`composer.json` contains `"php": "~8.4.0"`, which means ">= 8.4.0 and < 8.5.0").
+This PC has an **older PHP** on the global Windows PATH (used by other projects) and **PHP 8.4.28** in
+`C:\php-8.4.28`. Typing `php` runs the first `php.exe` on PATH — the old one.
 
 **Rule: never change the permanent Windows PATH** and never modify the other PHP installation.
-Instead, put PHP 8.4 at the front of PATH **only for the current terminal**.
-
-> **বাংলায়:** PATH হলো ফোল্ডারের একটা তালিকা, যেখানে Windows `php` নামের প্রোগ্রাম খোঁজে — প্রথমে যেটা পায় সেটাই চালায়।
-> আমরা শুধু বর্তমান টার্মিনালে `C:\php-8.4.28` কে তালিকার শুরুতে বসাই, তাই এই টার্মিনালে PHP 8.4 চলে।
-> টার্মিনাল বন্ধ করলে পরিবর্তন মুছে যায়, ফলে অন্য প্রজেক্টের পুরনো PHP নষ্ট হয় না।
-
-### 2.1 Temporary PATH — PowerShell
+Prepend PHP 8.4 **only for the current terminal**, and repeat this in **every** new terminal
+(including the extra terminals for the queue worker, Reverb and the scheduler):
 
 ```powershell
+# PowerShell
 $env:Path = "C:\php-8.4.28;$env:Path"
 php -v          # must print: PHP 8.4.28
 composer -V     # must show: PHP version 8.4.28
 ```
 
-- `$env:Path = "C:\php-8.4.28;$env:Path"` — prepends the PHP 8.4 folder to PATH for this PowerShell window only.
-- Run it again in **every new terminal**; it does not persist.
-
-### 2.2 Temporary PATH — Git Bash
-
 ```bash
+# Git Bash
 export PATH="/c/php-8.4.28:$PATH"
 php -v
 composer -V
 ```
 
-Git Bash uses `/c/...` paths and `:` as the separator instead of `;`.
+Or bypass PATH completely: `C:\php-8.4.28\php.exe artisan test`.
 
-### 2.3 Using the absolute path (always works)
+> **বাংলায়:** PATH হলো ফোল্ডারের তালিকা, যেখানে Windows `php` খোঁজে — প্রথমে যেটা পায় সেটাই চালায়। আমরা শুধু
+> বর্তমান টার্মিনালে PHP 8.4-এর ফোল্ডার শুরুতে বসাই। টার্মিনাল বন্ধ করলে পরিবর্তন মুছে যায়, তাই অন্য প্রজেক্টের
+> পুরনো PHP নষ্ট হয় না। চারটা টার্মিনাল খুললে চারটাতেই এটা করতে হবে।
 
-```powershell
-C:\php-8.4.28\php.exe artisan --version
-C:\php-8.4.28\php.exe artisan test
-```
+`.vscode/settings.json` sets `php.validate.executablePath` and prepends `C:\php-8.4.28` to PATH for **new**
+VS Code terminals of this workspace only. Still run `php -v` to confirm.
 
-This bypasses PATH completely. Useful when you are unsure which PHP a terminal uses.
+## 3. Composer on PHP 8.4
 
-## 3. VS Code workspace configuration
-
-The project contains `.vscode/settings.json` (it is the only `.vscode` file not ignored by `.gitignore`):
-
-```json
-{
-    "php.validate.executablePath": "C:\\php-8.4.28\\php.exe",
-
-    "terminal.integrated.env.windows": {
-        "PATH": "C:\\php-8.4.28;${env:PATH}"
-    }
-}
-```
-
-- `php.validate.executablePath` — VS Code's PHP syntax checking uses PHP 8.4 (so PHP 8.4 syntax is not reported as an error).
-- `terminal.integrated.env.windows.PATH` — every **new** terminal opened inside VS Code for this folder gets
-  `C:\php-8.4.28` at the front of PATH automatically. It only affects this workspace, not Windows.
-  Still run `php -v` to confirm — terminals opened before the setting existed keep the old PATH.
-
-## 4. Composer on PHP 8.4
-
-Composer is itself a PHP program. It checks the **PHP version it is running on** against `composer.json`.
-`composer -V` prints both versions, for example: `Composer version 2.8.8 ... PHP version 8.4.28`.
-
-If it shows the old PHP version, fix PATH (section 2) first.
-**Never bypass platform requirements** (do not use `--ignore-platform-reqs`): the installed packages must
-really match the PHP that runs the app.
+Composer checks the PHP it runs on against `composer.json`. **Never bypass platform requirements**
+(no `--ignore-platform-reqs`).
 
 | Command | What it does |
 |---|---|
-| `composer install` | Reads `composer.lock` and installs the exact locked package versions into `vendor/`. Use this after cloning. |
-| `composer update` | Resolves **new** versions allowed by `composer.json` and rewrites `composer.lock`. Do not run it casually. |
-| `composer dump-autoload` | Rebuilds `vendor/autoload.php` (class map). Useful after adding/moving classes if autoloading fails. |
-| `composer test` | Script in `composer.json`: runs `php artisan config:clear` then `php artisan test`. |
+| `composer install` | Installs the exact versions from `composer.lock` into `vendor/` (includes `laravel/reverb` v1.14 since V2). |
+| `composer update` | Resolves new versions and rewrites `composer.lock`. Do not run it casually. |
+| `composer dump-autoload` | Rebuilds the class map. |
+| `composer test` | `php artisan config:clear` + `php artisan test`. |
 
-Note: the `composer setup` script also runs `npm install` and `npm run build`. This project does not need npm,
-so it is simpler to run the steps of section 7 manually.
+Note: `composer dev` starts all four local processes in one terminal (`php artisan serve`, `queue:listen`,
+`reverb:start`, `schedule:work`) using `concurrently` (an npm dev dependency; run `npm ci` first).
+`composer setup` is the Laravel default and runs `migrate --force` - do not use it on a database with real data;
+follow the manual steps below instead.
 
-## 5. MySQL / MariaDB configuration
+## 4. Database (MariaDB / MySQL)
 
-### 5.1 Start the database server
+### 4.1 Start the server
 
-XAMPP Control Panel → **MySQL** → **Start** (XAMPP labels it MySQL even though it is MariaDB),
-or run `C:\xampp\mysql_start.bat`. It listens on `127.0.0.1:3306`, user `root`, empty password (XAMPP default — local only).
+XAMPP Control Panel → **MySQL** → **Start** (XAMPP labels it MySQL although it is MariaDB), or
+`C:\xampp\mysql_start.bat`. It listens on `127.0.0.1:3306`, user `root`, empty password (local only).
 
-### 5.2 Create the two databases
+### 4.2 Create the two databases
 
 | Database | Used by |
 |---|---|
-| `resolvedesk` | Development (`.env` → `DB_DATABASE=resolvedesk`) |
-| `resolvedesk_testing` | Automated tests (`phpunit.xml` → `<env name="DB_DATABASE" value="resolvedesk_testing"/>`) |
-
-Tests **wipe and rebuild** their database (`RefreshDatabase`), so they must never use the development database.
-
-Create both once, for example in phpMyAdmin (http://localhost/phpmyadmin) or the MariaDB client:
+| `resolvedesk` | Development (`.env` → `DB_DATABASE=resolvedesk`) — **contains data that must be preserved** |
+| `resolvedesk_testing` | Automated tests (`phpunit.xml`) — wiped by `RefreshDatabase` on every run |
 
 ```powershell
 C:\xampp\mysql\bin\mysql.exe -u root -e "CREATE DATABASE IF NOT EXISTS resolvedesk CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE DATABASE IF NOT EXISTS resolvedesk_testing CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
-`utf8mb4` stores every Unicode character (including Bangla text and emoji); it matches the `charset` and
-`collation` in `config/database.php`.
+### 4.3 Known harmless error
 
-### 5.3 MySQL 8 instead of MariaDB
+On MariaDB 10.4 `php artisan db:show` may fail mentioning `performance_schema`. The app is not affected; use
+`php artisan migrate:status`.
 
-Nothing in the code changes. Create the same two databases and set `DB_USERNAME` / `DB_PASSWORD` in `.env`.
-`DB_CONNECTION=mysql` is used for both MySQL and MariaDB here.
+## 5. Environment variables (`.env`)
 
-### 5.4 Known harmless error: `php artisan db:show`
+`.env` is git-ignored (secrets). `.env.example` is the template: `Copy-Item .env.example .env`.
+Laravel reads `env('KEY')` only inside `config/*.php`.
 
-On MariaDB 10.4, `php artisan db:show` may fail with an error that mentions **`performance_schema`**.
-The command tries to read MySQL-8 statistics that this MariaDB setup does not provide.
-**The application is not affected.** Use these instead:
+| Key | Example / meaning |
+|---|---|
+| `APP_NAME`, `APP_ENV`, `APP_DEBUG`, `APP_URL` | `ResolveDesk`, `local`, `true` (must be `false` in production), `http://127.0.0.1:8000` |
+| `APP_KEY` | generated by `php artisan key:generate` — never share |
+| `APP_TIMEZONE` | `Asia/Dhaka` (V2 kept it; timestamps are stored in this zone, not UTC) |
+| `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` | `mysql`, `127.0.0.1`, `3306`, `resolvedesk`, `root`, *(empty)* |
+| `SESSION_DRIVER` | `database` |
+| `QUEUE_CONNECTION` | `database` (jobs in `jobs`) |
+| `CACHE_STORE` | `database` (cache rows in `cache`, atomic locks in `cache_locks`) |
+| `BROADCAST_CONNECTION` | `reverb` (V2). Tests use `null`. |
+| `MAIL_MAILER` | `log` → emails written to `storage/logs/laravel.log` |
+| `LOG_CHANNEL`, `LOG_STACK`, `LOG_LEVEL` | `stack`, `single`, `debug` locally (production: `daily` — see [18](18-PRODUCTION-DEPLOYMENT.md)) |
+| `ATTACHMENT_DISK`, `ATTACHMENT_MAX_KB` | optional, read by `config/resolvedesk.php` (defaults `local`, `5120`) |
 
-```powershell
-php artisan migrate:status
-C:\xampp\mysql\bin\mysql.exe -u root resolvedesk -e "SHOW TABLES;"
-```
+### 5.1 Reverb variables (V2) — names only
 
-## 6. Environment variables (`.env`)
+| Variable | Used by |
+|---|---|
+| `REVERB_APP_ID`, `REVERB_APP_KEY`, `REVERB_APP_SECRET` | Laravel (to publish events) and the Reverb server (to accept them). **Secret values — generate your own, never commit or print them.** |
+| `REVERB_HOST`, `REVERB_PORT`, `REVERB_SCHEME` | Where Laravel and browsers reach Reverb (template: `localhost`, `8080`, `http`). |
+| `REVERB_SERVER_HOST`, `REVERB_SERVER_PORT` | Optional: the address the Reverb process listens on (`config/reverb.php` defaults `0.0.0.0`, `8080`). |
+| `VITE_REVERB_APP_KEY`, `VITE_REVERB_HOST`, `VITE_REVERB_PORT`, `VITE_REVERB_SCHEME` | Copied into the **browser bundle at build time** by Vite (`"${REVERB_APP_KEY}"` etc.). Only the public key goes to the browser — never the secret. |
 
-`.env` holds settings for **this machine** and is ignored by git (it can contain secrets).
-`.env.example` is the committed template. Create your file with:
+The `.env.example` values are empty placeholders. `php artisan reverb:install` can generate the ID/key/secret.
+(During V2 the installer did not write the keys, so random values were added to `.env` by hand.)
 
-```powershell
-Copy-Item .env.example .env
-```
+> **বাংলায়:** `VITE_` দিয়ে শুরু হওয়া ভেরিয়েবল `npm run build`-এর সময় JavaScript ফাইলের ভেতরে বসে যায়, তাই এগুলো
+> ব্রাউজারে সবাই দেখতে পায়। এজন্য শুধু public key (`REVERB_APP_KEY`) পাঠানো হয়, secret কখনো না। `.env` বদলালে
+> আবার `npm run build` দিতে হয়।
 
-Laravel reads `.env` through `env('KEY')` **only inside `config/*.php`**; the rest of the code uses `config('...')`.
-
-Keys this project actually relies on (values from `.env.example`):
-
-| Key | Example value | Meaning |
-|---|---|---|
-| `APP_NAME` | `ResolveDesk` | Shown in titles and the email "from" name. Also used for the cache key prefix. |
-| `APP_ENV` | `local` | `local` / `testing` / `production`. Lazy-loading protection is on when not `production`. |
-| `APP_KEY` | *(generated, never share)* | Encryption key — see section 7. |
-| `APP_DEBUG` | `true` | Detailed error pages. **Must be `false` in production.** |
-| `APP_URL` | `http://127.0.0.1:8000` | Base URL used for links, e.g. the ticket link in emails. |
-| `APP_TIMEZONE` | `Asia/Dhaka` | Read by `config/app.php` (`'timezone' => env('APP_TIMEZONE', 'UTC')`). Affects `now()`, SLA deadlines and displayed times. |
-| `DB_CONNECTION` | `mysql` | Database driver. |
-| `DB_HOST` / `DB_PORT` | `127.0.0.1` / `3306` | Database server address. |
-| `DB_DATABASE` | `resolvedesk` | Development database. |
-| `DB_USERNAME` / `DB_PASSWORD` | `root` / *(empty)* | Database login (XAMPP default). |
-| `SESSION_DRIVER` | `database` | Sessions stored in the `sessions` table. |
-| `SESSION_LIFETIME` | `120` | Minutes of inactivity before the session expires. |
-| `QUEUE_CONNECTION` | `database` | Queued jobs stored in the `jobs` table. |
-| `CACHE_STORE` | `database` | Cache stored in the `cache` table. |
-| `MAIL_MAILER` | `log` | Emails are written to `storage/logs/laravel.log` instead of being sent. |
-| `MAIL_SCHEME`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD` | — | SMTP settings (section 11). |
-| `MAIL_FROM_ADDRESS` / `MAIL_FROM_NAME` | `no-reply@resolvedesk.test` / `${APP_NAME}` | Sender of all emails. |
-| `LOG_CHANNEL` / `LOG_LEVEL` | `stack` / `debug` | Logging to `storage/logs/laravel.log`. |
-| `BCRYPT_ROUNDS` | `12` | Password hashing cost (tests use `4` for speed). |
-
-Redis, Memcached and AWS keys exist in the template but are **not used** by this project.
-
-## 7. APP_KEY
+## 6. Full installation sequence (fresh machine)
 
 ```powershell
-php artisan key:generate
-```
+# 0. PHP 8.4 in this terminal
+$env:Path = "C:\php-8.4.28;$env:Path"; php -v; composer -V
 
-- Generates a random 32-byte key and writes it into `.env` as `APP_KEY=base64:...`.
-- Laravel uses it to **encrypt cookies and the session cookie** and anything passed to `encrypt()`.
-- Without it you get the error *"No application encryption key has been specified."*
-- If you change it, all existing sessions/cookies become invalid (everybody is logged out).
-- Never commit or share it. Each machine/environment should have its own key.
-
-> **বাংলায়:** APP_KEY হলো অ্যাপের গোপন চাবি। এটা দিয়ে কুকি আর সেশন এনক্রিপ্ট করা হয়, যাতে কেউ ব্রাউজারে কুকি
-> বদলে অন্য ইউজার সাজতে না পারে। চাবি না থাকলে অ্যাপ চলবে না, আর চাবি ফাঁস হলে নিরাপত্তা ঝুঁকিতে পড়ে — তাই এটা কখনো গিটে রাখা যাবে না।
-
-## 8. Full installation sequence
-
-```powershell
-# 0. Use PHP 8.4 in this terminal
-$env:Path = "C:\php-8.4.28;$env:Path"
-php -v
-composer -V
-
-# 1. Install PHP packages from composer.lock
+# 1. PHP packages (from composer.lock)
 composer install
 
-# 2. Create .env and the application key
+# 2. JavaScript packages + real-time bundle (V2)
+npm ci            # exact versions from package-lock.json
+npm run build     # vite build -> public/build/manifest.json + assets
+
+# 3. .env and application key
 Copy-Item .env.example .env
 php artisan key:generate
+#    then set DB_* and the REVERB_* values (section 5.1); rebuild with npm run build after changing VITE_*
 
-# 3. Start MariaDB in XAMPP and create the two databases (section 5.2)
+# 4. Start MariaDB and create the databases (section 4)
 
-# 4. Create all tables
+# 5. Tables
 php artisan migrate
 
-# 5. Insert demo data
+# 6. Demo data (EMPTY database only)
 php artisan db:seed
-
-# 6. Start the web server (terminal 1)
-php artisan serve
-
-# 7. Start the queue worker (terminal 2, also with PHP 8.4 on PATH)
-php artisan queue:work
 ```
 
-Open http://127.0.0.1:8000 and log in with a demo account (password `password`, local only):
+- `npm ci` installs only `laravel-echo`, `pusher-js`, `vite`, `laravel-vite-plugin` (`npm audit`: 0 vulnerabilities
+  at the time of V2).
+- `vite.config.js` builds **only** `resources/js/realtime.js`. The layout loads it with `@vite` only when
+  `public/build/manifest.json` (or `public/hot`) exists, so skipping step 2 does not break pages.
+
+### 6.1 Upgrading an existing V1 database (what was done on the dev DB)
+
+1. **Back up first** (see [19](19-BACKUP-AND-RECOVERY.md)), e.g. `mysqldump` into `storage/app/backups/`.
+2. `php artisan migrate` — runs only the 8 new, **additive** V2 migrations. Never `migrate:fresh`.
+3. Optional: `php artisan db:seed --class=V2DemoDataSeeder` — **adds** 5 projects, 3 clients, 6 client-project and
+   8 project-agent links with `firstOrCreate` / `syncWithoutDetaching`. It never changes existing users or tickets.
+
+The V2 migrations (`database/migrations/2026_11_26_*`):
+
+| File | What it adds |
+|---|---|
+| `000001_create_projects_table` | `projects` (name, unique code, description, is_active) |
+| `000002_create_clients_table` | `clients` (name, unique code, email, phone, address, description, is_active) |
+| `000003_add_client_id_to_users_table` | nullable `users.client_id` FK |
+| `000004_create_project_pivot_tables` | `client_project`, `project_user` (unique pairs, restrict on delete) |
+| `000005_add_v2_columns_to_tickets_table` | `project_id`, `client_id`, `sla_notified_at`, `version` (default 1), `request_token`; unique `(created_by, request_token)`; indexes `(project_id,status)`, `(client_id,status)`, `(status,due_at)` |
+| `000006_add_visibility_to_comments_and_activities` | `ticket_comments.visibility` (default `public`), `ticket_activities.is_internal`, nullable `ticket_activities.user_id` (system activities) |
+| `000007_create_ticket_attachments_table` | `ticket_attachments` metadata |
+| `000008_add_notification_feed_index` | `notifications (notifiable_type, notifiable_id, created_at)` replaces the 2-column index |
+
+Existing tickets keep `project_id = NULL`, `client_id = NULL` → they are **global** tickets. All migrations have a
+`down()`; they were tested migrate → rollback → migrate on a restored copy (rolling back drops V2 data only).
+
+> **বাংলায়:** "Additive migration" মানে শুধু নতুন টেবিল বা নতুন nullable কলাম যোগ করা — পুরনো ডাটা মোছা বা বদলানো
+> হয় না। তাই চালু ডাটাবেসে `php artisan migrate` নিরাপদ, কিন্তু `migrate:fresh` সব টেবিল মুছে ফেলে — কখনো না।
+
+## 7. Demo accounts (local only, password `password`)
 
 | Role | Email |
 |---|---|
 | Admin | `admin@resolvedesk.test` |
-| Agent | `sarah.agent@resolvedesk.test` (also `david.agent@...`, `fatima.agent@...`, `michael.agent@...`) |
-| Customer | `john.customer@example.com` (also `emily.customer@...`, `rahim.customer@...`, `olivia.customer@...`) |
-| Inactive customer | `tanvir.customer@example.com` — login is refused (demonstrates `is_active`) |
+| Agents | `sarah.agent@resolvedesk.test` (HRMS, PAYROLL), `david.agent@…` (ERP, HRMS), `fatima.agent@…` (PAYROLL, ACCT), `michael.agent@…` (ERP, INV) |
+| Customers | `john.customer@example.com`, `emily.customer@…` (ACME), `rahim.customer@…` (GLOBEX), `olivia.customer@…` (standalone) |
+| Inactive | `tanvir.customer@example.com` — login refused |
 
-## 9. Artisan commands, migrations and seeders
+Customer ↔ client links exist only in a **freshly seeded** database. On the existing dev DB the customers stay
+standalone (link them on the user edit page if wanted).
 
-`php artisan` is Laravel's command-line tool (the `artisan` file in the project root).
+## 8. Running locally: four processes
+
+Open **four terminals**, set the PHP 8.4 PATH in each, then:
+
+| Terminal | Command | What it does | If it is not running |
+|---|---|---|---|
+| 1 | `php artisan serve` | Dev web server at http://127.0.0.1:8000 | No website |
+| 2 | `php artisan queue:work` | Runs `SendTicketEmail` jobs from the `jobs` table | Emails wait in `jobs`; everything else works |
+| 3 | `php artisan reverb:start` | WebSocket server (port 8080) for real-time toasts | Browser falls back to polling every 5 s |
+| 4 | `php artisan schedule:work` | Runs the scheduler every minute → `tickets:check-sla` | SLA reminders are sent at the next run |
+
+Useful extras: `php artisan reverb:start --debug` (prints connections and messages), `php artisan schedule:list`,
+`php artisan tickets:check-sla` (run the SLA check once), `php artisan queue:work --stop-when-empty`.
+
+**After changing PHP code or `.env`:** restart the worker (`php artisan queue:restart`, then start it again) and
+restart Reverb (`Ctrl+C`, `php artisan reverb:start`), because long-running processes keep old code in memory.
+
+> **বাংলায়:** ওয়েব সার্ভার শুধু রিকোয়েস্টের উত্তর দেয়। ইমেইল পাঠায় queue worker, সাথে সাথে নোটিফিকেশন পৌঁছায় Reverb,
+> আর প্রতি মিনিটে SLA চেক করে scheduler — তাই লোকালি চারটা আলাদা প্রসেস লাগে। কোনোটা বন্ধ থাকলেও মূল কাজ (টিকিট)
+> ঠিকমতো চলে — এটাকে graceful degradation বলে।
+
+On a Linux server the scheduler is one cron line (`* * * * * php artisan schedule:run`) and the worker/Reverb are
+kept alive by Supervisor or systemd — documented in [18](18-PRODUCTION-DEPLOYMENT.md), **not tested** here.
+
+## 9. Artisan, migrations and seeders
 
 | Command | What it actually does |
 |---|---|
-| `php artisan --version` | Prints the Laravel version (13.44.1). |
-| `php artisan migrate` | Runs every file in `database/migrations` that is **not yet recorded** in the `migrations` table, in filename order, and records it. Safe to repeat. |
-| `php artisan migrate:status` | Lists each migration and whether it has run. |
-| `php artisan migrate:rollback` | Calls `down()` of the last batch of migrations (drops those tables → **data loss** for them). |
-| `php artisan db:seed` | Runs `Database\Seeders\DatabaseSeeder::run()`: creates 10 users, 7 categories (1 inactive) and 32 tickets with activities, comments and notifications. Run it on an **empty** database — running it twice fails because emails/category names are unique. It also clears the two cache keys. |
-| `php artisan migrate:fresh --seed` | **DROPS ALL TABLES**, runs every migration again, then seeds. **Destroys all data.** Use only on your local development database, and only when you really want a clean demo. |
-| `php artisan route:list --except-vendor` | Shows every route: method, URL, name, controller and middleware. |
-| `php artisan tinker` | Interactive PHP shell with the app loaded, e.g. `App\Models\Ticket::count()`. |
-| `php artisan config:clear` | Deletes the cached config file so `.env` changes are read again. |
-| `php artisan cache:clear` | Empties the application cache store (the `cache` table here). |
-| `php artisan optimize:clear` | Clears config, route, view and application caches at once. |
+| `php artisan migrate` | Runs migrations not yet recorded in `migrations`. Safe to repeat. |
+| `php artisan migrate:status` | Which migrations ran. |
+| `php artisan migrate:rollback` | Runs `down()` of the last batch → **data loss** for those columns/tables. Ask first. |
+| `php artisan db:seed` | `DatabaseSeeder` (calls `V2DemoDataSeeder` too). **Empty database only** (unique emails). |
+| `php artisan db:seed --class=V2DemoDataSeeder` | Additive V2 demo projects/clients. Safe on existing data. |
+| `php artisan migrate:fresh --seed` | **Drops all tables.** Never on the dev DB with real data; only on a throw-away DB. |
+| `php artisan route:list --except-vendor` | All routes with middleware. |
+| `php artisan optimize:clear` | Clears config, route, view and application caches. |
+| `php artisan cache:clear` | Empties the `cache` table (also removes email de-dup keys). |
 
-> **Warning:** `migrate:fresh`, `migrate:rollback`, `migrate:reset` and `db:wipe` delete data.
-> Never run them against a database whose data you need.
+> **Warning:** `migrate:fresh`, `migrate:reset`, `migrate:rollback` and `db:wipe` delete data.
 
-> **বাংলায়:** Migration হলো ডাটাবেসের টেবিল তৈরির কোড — `migrate` শুধু নতুন (এখনো না চালানো) migration চালায়, তাই বারবার চালানো নিরাপদ।
-> Seeder নমুনা ডাটা ঢোকায়। কিন্তু `migrate:fresh` সব টেবিল মুছে নতুন করে বানায় — এতে সব ডাটা হারিয়ে যায়, তাই শুধু লোকাল ডেমো ডাটাবেসে ব্যবহার করবে।
+## 10. Code style (Pint, V2)
 
-## 10. Application and queue worker startup
+`pint.json` uses the Laravel preset plus `concat_space: one` (keeps the existing `'a' . 'b'` style).
+Format only the files you changed:
 
-### 10.1 Web server
-
-```powershell
-php artisan serve
+```bash
+vendor/bin/pint --dirty     # Git Bash
+vendor\bin\pint --dirty     # PowerShell
+vendor/bin/pint --test      # report only, change nothing
 ```
 
-Starts PHP's built-in development web server at http://127.0.0.1:8000 and sends every request to
-`public/index.php`. Stop it with `Ctrl+C`. It is for development only (not for production).
+Line endings are LF (`.gitattributes` → `eol=lf`). Editors on Windows can silently write CRLF — check before committing.
 
-### 10.2 Queue worker
+## 11. SMTP (Gmail) — not verified
 
-Emails are **not sent during the web request**. `TicketService::queueEmail()` inserts a `SendTicketEmail`
-job row into the `jobs` table after the transaction commits. A separate long-running process must execute it:
+`MAIL_MAILER=log` was used and verified (emails appear in `storage/logs/laravel.log`). Real Gmail delivery was
+**not** verified. To try it: set `MAIL_MAILER=smtp`, `MAIL_HOST=smtp.gmail.com`, `MAIL_PORT=587`,
+`MAIL_USERNAME`, `MAIL_PASSWORD` (a 16-character **App Password**, needs 2-Step Verification),
+`MAIL_FROM_ADDRESS`; then `php artisan config:clear` and restart the worker. Never commit the password.
 
-| Command | What it does |
-|---|---|
-| `php artisan queue:work` | Starts a worker that keeps polling the `jobs` table, runs each job's `handle()` and deletes the row on success. Leave it running in its own terminal. |
-| `php artisan queue:work --stop-when-empty` | Processes all waiting jobs, then exits (used during verification). |
-| `php artisan queue:failed` | Lists jobs that failed after all attempts (`SendTicketEmail::$tries = 3`); they are stored in `failed_jobs`. |
-| `php artisan queue:retry all` | Moves every failed job back into the queue. You can also pass one UUID: `php artisan queue:retry <uuid>`. |
-| `php artisan queue:restart` | Tells running workers to exit gracefully after the current job. **Run it after changing code or `.env`**, because a worker loads the app once and keeps old code in memory. Then start the worker again (there is no Supervisor on this PC). |
+## 12. Cache configuration (summary)
 
-If the worker is not running: tickets, activities and **in-app notifications still work** (notifications are
-not queued). Only emails wait in the `jobs` table until a worker starts.
+`CACHE_STORE=database` → `cache` table (keys prefixed `resolvedesk-cache-`) and `cache_locks` table for
+`Cache::lock()`. Keys: `dashboard:admin:stats` (60 s), `ticket:active-categories` (3600 s),
+`ticket-assignment` (lock, 10 s), `ticket-email-sent:{notification id}` (2 days), plus the scheduler's
+`withoutOverlapping` lock. Tests use `CACHE_STORE=array`. Details: [Caching guide](15-CACHING-GUIDE.md).
 
-> **বাংলায়:** Queue মানে কাজের লাইন। ওয়েব রিকোয়েস্ট শুধু "ইমেইল পাঠাতে হবে" — এই কাজটা `jobs` টেবিলে লিখে রাখে, তাই
-> ইউজারকে অপেক্ষা করতে হয় না। আলাদা টার্মিনালে চলা `queue:work` প্রসেস লাইন থেকে কাজ তুলে আসলে ইমেইল পাঠায়।
-> কোড বদলালে `queue:restart` দিতে হয়, কারণ worker পুরনো কোড মেমোরিতে ধরে রাখে।
+## 13. Tests
 
-Details: [Queue and email guide](14-QUEUE-AND-EMAIL-GUIDE.md).
-
-## 11. SMTP configuration (Gmail)
-
-By default `MAIL_MAILER=log`: each email is written to `storage/logs/laravel.log`. This was verified (both
-queued emails appeared in the log with correct To/Subject/body).
-**Real Gmail delivery was NOT verified** (no credentials were available).
-
-To send through Gmail, edit `.env`:
-
-```dotenv
-MAIL_MAILER=smtp
-MAIL_SCHEME=null
-MAIL_HOST=smtp.gmail.com
-MAIL_PORT=587
-MAIL_USERNAME=your.address@gmail.com
-MAIL_PASSWORD=your16characterapppassword
-MAIL_FROM_ADDRESS="your.address@gmail.com"
-MAIL_FROM_NAME="${APP_NAME}"
-```
-
-Then:
-
-```powershell
-php artisan config:clear
-php artisan queue:restart     # then start the worker again
-```
-
-**What is a Gmail App Password?** Gmail does not accept your normal account password from apps like this.
-You must turn on **2-Step Verification** for the Google account, then create an **App Password**
-(Google Account → Security → App passwords). Google shows a 16-character password once; put it in
-`MAIL_PASSWORD` without spaces. It only works for mail access and can be revoked at any time.
-
-- Port **587** uses STARTTLS (connection starts plain and upgrades to encryption). Port **465** uses direct SSL;
-  for that, set `MAIL_PORT=465` and `MAIL_SCHEME=smtps`.
-- Never commit the real password. It belongs only in `.env`.
-- If sending fails, the worker retries 3 times (10 seconds apart), then `SendTicketEmail::failed()` writes
-  *"Ticket email failed permanently"* to the log and the job appears in `php artisan queue:failed`.
-
-> **বাংলায়:** Gmail সাধারণ পাসওয়ার্ড দিয়ে অ্যাপকে মেইল পাঠাতে দেয় না। 2-Step Verification চালু করে একটা আলাদা
-> ১৬ অক্ষরের "App Password" বানাতে হয়, সেটা শুধু `.env`-এর `MAIL_PASSWORD`-এ বসাতে হয়। দরকার হলে এই পাসওয়ার্ড
-> আলাদাভাবে বাতিল করা যায়, তাই মূল পাসওয়ার্ড ঝুঁকিতে পড়ে না।
-
-## 12. Cache configuration
-
-- `CACHE_STORE=database` → values are stored in the `cache` table (`key`, `value`, `expiration`).
-- The default prefix comes from `config/cache.php`:
-  `'prefix' => env('CACHE_PREFIX', Str::slug((string) env('APP_NAME', 'laravel')).'-cache-')`,
-  so with `APP_NAME=ResolveDesk` the stored keys look like `resolvedesk-cache-dashboard:admin:stats`.
-- Keys used by the app:
-
-| Key | TTL | Defined in | Cleared by |
-|---|---|---|---|
-| `dashboard:admin:stats` | 60 s | `TicketService::DASHBOARD_CACHE_KEY`, `DashboardController::ADMIN_STATS_TTL_SECONDS` | `TicketService::clearDashboardCache()`, `CategoryController::clearCaches()`, seeder |
-| `ticket:active-categories` | 3600 s | `Category::ACTIVE_CACHE_KEY`, `Category::ACTIVE_CACHE_TTL_SECONDS` | `Category::clearActiveCache()` |
-
-- Clear everything manually: `php artisan cache:clear`.
-- Tests use `CACHE_STORE=array` (`phpunit.xml`), an in-memory cache that disappears after each test.
-- Redis is **not** used (future improvement only).
-
-Details: [Caching guide](15-CACHING-GUIDE.md).
-
-## 13. Testing commands
-
-Tests live in `tests/Feature` (9 files: `AuthTest`, `AuthorizationTest`, `CacheTest`, `NotificationTest`,
-`PageRenderingTest`, `QueueAndEmailTest`, `TicketManagementTest`, `TicketWorkflowTest`,
-`UserAndCategoryManagementTest`). `phpunit.xml` overrides the environment for tests:
+`phpunit.xml` overrides the environment for tests:
 
 ```xml
-<env name="APP_ENV" value="testing"/>
+<env name="BROADCAST_CONNECTION" value="null"/>
 <env name="CACHE_STORE" value="array"/>
 <env name="DB_CONNECTION" value="mysql"/>
 <env name="DB_DATABASE" value="resolvedesk_testing"/>
@@ -377,35 +283,36 @@ Tests live in `tests/Feature` (9 files: `AuthTest`, `AuthorizationTest`, `CacheT
 <env name="SESSION_DRIVER" value="array"/>
 ```
 
-So tests never touch the `resolvedesk` database, never send real email, and run queued jobs immediately.
-MariaDB must be running and `resolvedesk_testing` must exist.
+16 files in `tests/Feature`: `AuthTest`, `AuthorizationTest`, `CacheTest`, `ConsistencyTest`,
+`InternalNotesAndAttachmentsTest`, `MySqlConcurrencyTest`, `NotificationTest`, `PageRenderingTest`,
+`ProjectAndClientTest`, `QueueAndEmailTest`, `RealtimeAndDeliveryTest`, `SlaReportsAndHardeningTest`,
+`TicketManagementTest`, `TicketScopeTest`, `TicketWorkflowTest`, `UserAndCategoryManagementTest`.
+Last recorded run: **170 passed / 682 assertions** on MariaDB 10.4.
 
 | Command | What it does |
 |---|---|
-| `php artisan test` | Runs the whole suite. The last recorded run in `DEVELOPMENT_PROGRESS.md` passed every test. |
-| `php artisan test tests/Feature/CacheTest.php` | Runs one test file. |
-| `php artisan test --filter=test_admin_dashboard_creates_the_statistics_cache` | Runs one test method (the filter is a name pattern; it can also match a class name, e.g. `--filter=CacheTest`). |
-| `php artisan test --stop-on-failure` | Stops at the first failure — easier to read. |
-| `composer test` | `config:clear` + `php artisan test`. |
-
-Always use PHP 8.4 (section 2) before running tests.
+| `php artisan test` | Whole suite (MariaDB must be running). |
+| `php artisan test --filter=ConsistencyTest` | One class (or method name pattern). |
+| `php artisan test tests/Feature/MySqlConcurrencyTest.php` | Two real DB connections testing row locks. |
+| `php artisan test --stop-on-failure` | Stop at the first failure. |
 
 ## 14. Common setup problems
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Your Composer dependencies require a PHP version ">= 8.4.0"` or `php -v` shows an old version | The old PHP on PATH is being used | Set the temporary PATH (section 2) or use `C:\php-8.4.28\php.exe`. Never use `--ignore-platform-reqs`. |
-| `could not find driver` | `pdo_mysql` extension disabled in `C:\php-8.4.28\php.ini` | Enable `extension=pdo_mysql`, open a new terminal, check `php -m`. |
-| `SQLSTATE[HY000] [2002] No connection could be made...` | MariaDB/MySQL is not running | Start MySQL in the XAMPP Control Panel. Check port 3306 is not used by another server. |
-| `SQLSTATE[HY000] [1049] Unknown database 'resolvedesk'` | Database not created | Create it (section 5.2). |
-| `SQLSTATE[HY000] [1045] Access denied` | Wrong `DB_USERNAME`/`DB_PASSWORD` | Fix `.env`, then `php artisan config:clear`. |
+| `php -v` shows an old version / Composer platform error | Old PHP on PATH | Section 2. Never `--ignore-platform-reqs`. |
+| `could not find driver` | `pdo_mysql` disabled | Enable it in `C:\php-8.4.28\php.ini`, new terminal. |
+| `SQLSTATE[HY000] [2002]` | MariaDB not running | Start MySQL in XAMPP. |
+| **`php artisan test` hangs for a long time with no output** | **MariaDB is stopped**: every test waits for the connection timeout before failing | Start MariaDB first (XAMPP), stop the run with `Ctrl+C`, run again. |
+| **`php artisan serve` ignores `$env:DB_DATABASE=...` (or `DB_DATABASE=... php artisan serve`)** | `serve` restarts PHP's built-in server and passes only a small allow-list of environment variables to it, so the child process reads `DB_DATABASE` from `.env` again | Change `.env` temporarily, or start the built-in server directly: `php -S 127.0.0.1:8000 -t public vendor/laravel/framework/src/Illuminate/Foundation/resources/server.php` (that is how the isolated-DB E2E check was run). |
 | `No application encryption key has been specified.` | `APP_KEY` empty | `php artisan key:generate`. |
-| `.env` changes have no effect | Config is cached, or the worker is old | `php artisan config:clear`; `php artisan queue:restart` and start the worker again. |
-| `Duplicate entry 'admin@resolvedesk.test'` when seeding | Seeder run on a non-empty database | Use `php artisan migrate:fresh --seed` (**destroys data**) on the local dev DB only. |
-| `php artisan db:show` fails mentioning `performance_schema` | MariaDB 10.4 does not provide what the command reads | Harmless; use `migrate:status` or the MariaDB client. |
-| Emails never appear | No queue worker running (jobs are waiting in `jobs`) | `php artisan queue:work`; check `php artisan queue:failed` and `storage/logs/laravel.log`. |
-| "419 Page Expired" after submitting a form | Session expired or the CSRF token is missing/old | Refresh the page and log in again. Every form must contain `@csrf`. |
-| `Attempted to lazy load [relation] on model [...] but lazy loading is disabled` | A relationship is used in a loop without `with()` (protection from `Model::preventLazyLoading()`) | Add the relationship to `with([...])` / `load([...])` in the controller. |
-| Admin dashboard numbers look old | Statistics are cached for up to 60 s | Wait, or `php artisan cache:clear`. Normal ticket changes clear it automatically. |
-| A test fails with a database error | MariaDB not running, or `resolvedesk_testing` missing | Start MariaDB, create the test database. |
-| Times look wrong by several hours | `APP_TIMEZONE` missing | Set `APP_TIMEZONE=Asia/Dhaka`, then `php artisan config:clear`. |
+| `.env` change has no effect | Cached config or old long-running process | `php artisan config:clear`; restart worker, Reverb and scheduler. |
+| No real-time toast, but notifications appear after ~5 s | Reverb not running, bundle not built, or wrong `VITE_REVERB_*` | `php artisan reverb:start`; `npm run build`; see [11](11-DEBUGGING-GUIDE.md) Part 4. |
+| `Vite manifest not found` | Should not happen (layout checks the manifest) — if you added `@vite` elsewhere | `npm run build`. |
+| Broadcasting error "app key/secret missing" | `BROADCAST_CONNECTION=reverb` without `REVERB_APP_*` values | Fill the REVERB values in `.env`, `php artisan config:clear`. Ticket operations still succeed (broadcast errors are caught and logged). |
+| HTTP 429 "Too Many Requests" while testing | Named rate limiter (e.g. 10 tickets/min) | Wait one minute or `php artisan cache:clear` (local only). |
+| Emails never appear | No queue worker | `php artisan queue:work`; check `queue:failed`. |
+| `Duplicate entry` when seeding | `db:seed` on a non-empty DB | Use `--class=V2DemoDataSeeder` (additive) instead. |
+| `npm ci` fails | `package-lock.json` / Node mismatch | Use Node 20; `npm install` only if you intend to update the lock file. |
+| 419 Page Expired | Session expired / missing CSRF token | Refresh and log in again. |
+| Times wrong by hours | `APP_TIMEZONE` missing | `APP_TIMEZONE=Asia/Dhaka`, `php artisan config:clear`. |

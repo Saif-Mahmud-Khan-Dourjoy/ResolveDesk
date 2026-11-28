@@ -56,7 +56,27 @@
                     @endforeach
                 </select>
             </div>
+            <div class="col-6 col-md-4 col-xl-2">
+                <label for="project_id" class="form-label small mb-1">Project</label>
+                <select id="project_id" name="project_id" class="form-select">
+                    <option value="">All projects</option>
+                    <option value="global" @selected(request('project_id') === 'global')>Global (no project)</option>
+                    @foreach ($projects as $project)
+                        <option value="{{ $project->id }}" @selected((string) request('project_id') === (string) $project->id)>{{ $project->code }}</option>
+                    @endforeach
+                </select>
+            </div>
             @if (auth()->user()->isAdmin())
+                <div class="col-6 col-md-4 col-xl-2">
+                    <label for="client_id" class="form-label small mb-1">Client</label>
+                    <select id="client_id" name="client_id" class="form-select">
+                        <option value="">All clients</option>
+                        <option value="internal" @selected(request('client_id') === 'internal')>Internal (no client)</option>
+                        @foreach ($clients as $client)
+                            <option value="{{ $client->id }}" @selected((string) request('client_id') === (string) $client->id)>{{ $client->code }}</option>
+                        @endforeach
+                    </select>
+                </div>
                 <div class="col-6 col-md-4 col-xl-3">
                     <label for="assigned_to" class="form-label small mb-1">Assigned agent</label>
                     <select id="assigned_to" name="assigned_to" class="form-select">
@@ -97,6 +117,7 @@
                 <tr>
                     <th>Ticket</th>
                     <th>Subject</th>
+                    <th>Project / Client</th>
                     <th>Category</th>
                     <th>Priority</th>
                     <th>Status</th>
@@ -112,6 +133,10 @@
                     <tr class="{{ $ticket->isOverdue() ? 'row-overdue' : '' }}">
                         <td class="fw-semibold text-nowrap"><a href="{{ route('tickets.show', $ticket) }}" class="text-decoration-none">{{ $ticket->ticket_number }}</a></td>
                         <td><div class="ticket-subject text-truncate" title="{{ $ticket->subject }}">{{ $ticket->subject }}</div></td>
+                        <td class="text-nowrap small">
+                            {{ $ticket->project?->code ?? 'Global' }}
+                            <div class="text-muted">{{ $ticket->client?->code ?? 'Internal' }}</div>
+                        </td>
                         <td class="text-nowrap">{{ $ticket->category->name }}</td>
                         <td>@include('partials.ticket-badges', ['ticket' => $ticket, 'only' => 'priority'])</td>
                         <td class="text-nowrap">
@@ -133,7 +158,7 @@
                     </tr>
                 @empty
                     <tr>
-                        <td colspan="10" class="text-center text-muted py-5">
+                        <td colspan="11" class="text-center text-muted py-5">
                             <i class="bi bi-inbox fs-3 d-block mb-2"></i>
                             No tickets match your filters.
                         </td>

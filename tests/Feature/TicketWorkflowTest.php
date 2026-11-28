@@ -2,10 +2,10 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\SendTicketEmail;
 use App\Models\Ticket;
 use App\Models\TicketActivity;
 use App\Models\User;
-use App\Notifications\TicketNotification;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Queue;
 use Tests\TestCase;
@@ -77,7 +77,7 @@ class TicketWorkflowTest extends TestCase
 
         $this->assertSame(1, TicketActivity::where('action', 'assigned')->count());
         $this->assertSame(1, $agent->notifications()->count());
-        Queue::assertPushed(\App\Jobs\SendTicketEmail::class, 1);
+        Queue::assertPushed(SendTicketEmail::class, 1);
     }
 
     // ---- Automatic assignment -------------------------------------------------
@@ -119,7 +119,7 @@ class TicketWorkflowTest extends TestCase
 
         $this->actingAs($this->admin)
             ->post(route('tickets.auto-assign', $ticket))
-            ->assertSessionHas('error', 'No active support agent is available. The ticket remains Open.');
+            ->assertSessionHas('error', 'No eligible active support agent is available. The ticket remains Open.');
 
         $this->assertSame(Ticket::STATUS_OPEN, $ticket->fresh()->status);
         $this->assertNull($ticket->fresh()->assigned_to);
@@ -147,7 +147,9 @@ class TicketWorkflowTest extends TestCase
             'ticket_id' => $ticket->id, 'action' => 'reassigned', 'old_value' => $oldAgent->name, 'new_value' => $newAgent->name,
         ]);
         $this->assertSame(1, $newAgent->notifications()->count());
-        $this->assertSame(0, $oldAgent->notifications()->count());
+        // V2: the previous agent gets ONE short in-app notice (no subject, no email).
+        $this->assertSame(1, $oldAgent->notifications()->count());
+        $this->assertSame('unassigned', $oldAgent->notifications()->first()->data['event_type']);
         $this->assertSame(0, $oldAgent->assignedTickets()->count(), 'ticket leaves the previous agent list');
     }
 

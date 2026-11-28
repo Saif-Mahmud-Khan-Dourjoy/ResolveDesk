@@ -2,6 +2,7 @@
 
 namespace Database\Factories;
 
+use App\Models\Client;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Factories\Factory;
 use Illuminate\Support\Facades\Hash;
@@ -42,6 +43,12 @@ class UserFactory extends Factory
     public function customer(): static
     {
         return $this->state(['role' => User::ROLE_CUSTOMER]);
+    }
+
+    /** V2: a customer of the given client organization. */
+    public function forClient(Client $client): static
+    {
+        return $this->state(['role' => User::ROLE_CUSTOMER, 'client_id' => $client->id]);
     }
 
     public function inactive(): static

@@ -1,7 +1,12 @@
 # 15 — Caching Guide
 
-This guide explains the two caches in ResolveDesk, what is deliberately **not** cached, and how the cache is kept
-correct. Redis is described only as a *future improvement* — it is **not** used.
+This guide explains the caches in ResolveDesk, what is deliberately **not** cached, how the cache is kept
+correct, and (V2) how the same cache store is used for **atomic locks** and **email de-duplication**.
+Redis is described only as a *future improvement* — it is **not** used.
+
+**V2 summary:** the admin statistics now also contain project, client and SLA-compliance numbers, so the cache is
+also cleared when projects, clients, users or associations change. `Cache::lock()` (table `cache_locks`) serializes
+ticket assignment, and `ticket-email-sent:{id}` keys stop a retried email job from sending twice. See sections 13–16.
 
 Files covered:
 
@@ -15,6 +20,11 @@ Files covered:
 | `database/migrations/0001_01_01_000001_create_cache_table.php` | `cache` and `cache_locks` tables |
 | `database/seeders/DatabaseSeeder.php` | Clears both keys after seeding |
 | `tests/Feature/CacheTest.php` | 8 cache tests |
+| `app/Services/TicketAssignmentService.php` → `withAssignmentLock()` (V2) | `Cache::lock('ticket-assignment')` atomic lock |
+| `app/Services/ProjectService.php`, `ProjectController`, `ClientController`, `UserController` → `clearCaches()` / `Cache::forget` (V2) | Dashboard invalidation after project, client, user and association changes |
+| `app/Jobs/SendTicketEmail.php` → `handle()` (V2) | `ticket-email-sent:{delivery_key}` de-dup key |
+| `routes/console.php` → `withoutOverlapping()` (V2) | Scheduler overlap lock (framework, same store) |
+| `config/resolvedesk.php` → `assignment_lock` (V2) | Lock key, expiry and wait time |
 
 Related: [Business logic](06-BUSINESS-LOGIC-GUIDE.md), [System design](10-SYSTEM-DESIGN-GUIDE.md).
 
@@ -173,11 +183,23 @@ Called **after** `DB::transaction()` returns (i.e. after a successful commit) in
 
 | Method | Why the stats change |
 |---|---|
-| `createTicket()` | total, open count, category/priority counts, trend |
-| `updateTicket()` | priority or category may change |
-| `assignAgent()` (only if `$wasChanged`) | Open → Assigned |
-| `autoAssign()` (only if an agent was chosen) | Open → Assigned |
-| `startWork()`, `resolve()`, `reopen()`, `close()` | status counts, average resolution time |
+| `TicketService::createTicket()` | total, open count, category/priority/project/client counts, trend |
+| `TicketService::updateTicket()` | priority or category may change |
+| `TicketAssignmentService::assignAgent()` (only if `$wasChanged`) | Open → Assigned (V2: calls `Cache::forget(TicketService::DASHBOARD_CACHE_KEY)` directly) |
+| `TicketAssignmentService::autoAssign()` (only if an agent was chosen) | Open → Assigned |
+| `startWork()`, `resolve()`, `reopen()`, `close()` | status counts, SLA compliance, average resolution time |
+| `processSlaBreach()` (only if a reminder was sent) (V2) | keeps the dashboard in step with SLA activity |
+
+V2 also clears the same key outside the ticket services, because the cached array now contains
+`active_projects`, `active_clients`, `active_agents`, `project_counts` and `client_counts`:
+
+| Where (V2) | Trigger |
+|---|---|
+| `ProjectController::clearCaches()` | project created / updated / activated / deactivated |
+| `ProjectService::clearCaches()` | project↔client or project↔agent association changed (`syncClients()`, `syncAgents()`) |
+| `ClientController::clearCaches()` | client created / updated / activated / deactivated |
+| `UserController` (`store`, `update`, `toggleActive`) | "active agents" count may change |
+| `CategoryController::clearCaches()` | category counts (unchanged from V1) |
 
 Not called in `addComment()` — comments do not affect any cached statistic.
 
@@ -388,6 +410,12 @@ php artisan cache:clear    # deletes ALL cache rows (safe: everything is rebuilt
 | Unread notification count | Polled every 5 s; must be exact. |
 | User permissions, `is_active`, authentication | Security decisions must use the database (`ActiveUserMiddleware` re-reads the user on every request). |
 | Agent and customer dashboards | Spec decision for this version; per-user keys would need per-user invalidation. |
+| **Assignment eligibility** (`Ticket::canBeAssignedTo()`, `eligibleAgents()`) (V2) | Read from `project_user` on every assignment; a cached list could assign a ticket to an agent just removed from the project. |
+| **Ticket scope checks** (`resolveScope()`, `selectableProjects()`) (V2) | Client isolation is a security rule; always from the database (with a shared lock on the project row). |
+| **Report page and CSV export** (V2) | Filters make every result different; the export streams fresh rows with `chunkById(500)`. |
+| **Overdue count and recent activity on the admin dashboard** | Time-based / must be current. |
+| **Notification feed** | Exact unread count and ids; the WebSocket only signals "something new", the feed reads the DB. |
+| **`version` / ticket rows for locking** | Concurrency control must use the database row (`FOR UPDATE`, conditional `UPDATE`). |
 
 Rule of thumb: **cache only data that is expensive, read often, and where a few seconds of staleness is harmless.
 Never use cached data for validation or security.**
@@ -417,7 +445,8 @@ category list gets 1 hour.
 
 - Database cache = still a DB query per read; it shares the same database server as the application.
 - Expired rows are not deleted immediately; they stay until overwritten or `cache:clear`.
-- No protection against cache stampede (could use `Cache::lock()` / `Cache::flexible()` — *future*).
+- No protection against cache stampede for the dashboard (could use `Cache::lock()` around the rebuild or
+  `Cache::flexible()` — *future*). `Cache::lock()` **is** used in V2, but only for assignment (section 14).
 - `Cache::forget()` must be remembered in every code path that changes cached data. Forgetting one = up to 60 s
   stale data. (That is why the key is a constant and the invalidation is centralised in `TicketService`.)
 - Re-seeding does not automatically empty the cache (`migrate:fresh` recreates the `cache` table, but a plain
@@ -458,6 +487,9 @@ Redis could also replace the database **queue** (`QUEUE_CONNECTION=redis`) later
 | New category missing from the form | Was it saved through `CategoryController` (clears the key)? Else `php artisan cache:clear`. |
 | "Statistics generated at" never changes | Every request is a hit → expected within 60 s if nothing changed. |
 | Error "Table 'cache' doesn't exist" | Run migrations; `CACHE_STORE=database` needs the `cache` table. |
+| (V2) "Another assignment is being processed right now" | Assignment lock busy for more than 5 s. `SELECT * FROM cache_locks;` — a row whose `expiration` is in the past is ignored and replaced automatically; a stuck lock disappears after 10 s. |
+| (V2) Project/client counts old | Was the change made through the UI (clears the key) or directly in SQL? Wait 60 s or `Cache::forget('dashboard:admin:stats')`. |
+| (V2) A retried email was not sent | Its `ticket-email-sent:{notification id}` key exists → it was already sent once (log line "Ticket email already sent; skipping duplicate attempt"). |
 | `TypeError ... __PHP_Incomplete_Class returned` | An object (model/collection) was cached; `serializable_classes => false` blocks it. Cache a plain array instead (see 5.1), then `php artisan cache:clear`. |
 
 ## 12. Practice modifications
@@ -467,3 +499,120 @@ Redis could also replace the database **queue** (`QUEUE_CONNECTION=redis`) later
    `dashboard/admin.blade.php`. Is the existing invalidation enough? (Yes — `createTicket()` already clears it.)
 3. Cache the agent dashboard per agent with key `dashboard:agent:{id}` — then list every `TicketService` method
    that would need to forget it. This exercise shows why it was **not** done.
+4. (V2) Make the assignment lock wait 10 s instead of 5: `config/resolvedesk.php` → `assignment_lock.wait_seconds`.
+   Run `php artisan test --filter=test_assignment_waits_for_the_lock_and_reports_a_timeout` and explain the result.
+5. (V2) Add "tickets per category for project X" to the cached stats. Which `Cache::forget()` calls are already
+   enough, and which change would make it stale? (Answer: ticket and category changes already clear it.)
+
+---
+
+## 13. V2 dashboard statistics in the cache
+
+`DashboardController::buildAdminStatistics()` (cache miss only) now also computes:
+
+| Key in the cached array | Query (simplified SQL) |
+|---|---|
+| `global_count` | `SELECT COUNT(*) FROM tickets WHERE project_id IS NULL` |
+| `project_ticket_count` | `total - global_count` |
+| `project_counts` | `SELECT projects.code, COUNT(*) FROM tickets JOIN projects ON projects.id = tickets.project_id GROUP BY projects.code ORDER BY 2 DESC` |
+| `client_counts` | same with `clients`, plus `'Internal' => COUNT(*) WHERE client_id IS NULL` |
+| `sla_compliance`, `resolved_within_sla`, `resolved_after_sla` | `Ticket::slaSummary(Ticket::query())` — depends only on resolved tickets (`resolved_at` vs `due_at`), so it is safe to cache |
+| `active_projects`, `active_clients`, `active_agents` | `COUNT(*) ... WHERE is_active = 1` |
+
+All values are plain integers/arrays (never models), so they serialize safely into the `cache` table.
+The live overdue count and the recent-activity list are computed **outside** `Cache::remember()`.
+
+> **বাংলায়:** V2-তে dashboard-এর cache-এ project আর client অনুযায়ী টিকিট সংখ্যা যোগ হয়েছে। তাই শুধু টিকিট নয়,
+> project/client/user বদলালেও cache মুছতে হয় — নাহলে "active projects" সংখ্যা ৬০ সেকেন্ড পর্যন্ত পুরনো থাকতে পারে।
+
+## 14. Atomic locks: `Cache::lock()` and the `cache_locks` table
+
+`TicketAssignmentService::withAssignmentLock()`:
+
+```php
+$lock = Cache::lock(
+    config('resolvedesk.assignment_lock.key'),      // 'ticket-assignment'
+    config('resolvedesk.assignment_lock.seconds')   // auto-expires after 10 s
+);
+
+$this->notifier->holdSideEffects();
+
+try {
+    return $lock->block(config('resolvedesk.assignment_lock.wait_seconds'), $operation); // wait up to 5 s
+} catch (LockTimeoutException) {
+    throw ValidationException::withMessages([
+        'ticket' => 'Another assignment is being processed right now. Please try again in a moment.',
+    ]);
+} finally {
+    $this->notifier->releaseSideEffects();
+}
+```
+
+How it works with `CACHE_STORE=database`:
+
+1. **Acquire** = `INSERT IGNORE INTO cache_locks (key, owner, expiration) VALUES ('resolvedesk-cache-ticket-assignment', '<random owner>', now+10)`
+   (`insertOrIgnore()`). The primary key on `key` means 0 rows are inserted if someone else holds it. Then Laravel
+   tries `UPDATE cache_locks SET owner = ?, expiration = ? WHERE key = ? AND (owner = ? OR expiration <= now)` —
+   that takes over an **expired** lock.
+2. **block(5)** retries acquiring about every 250 ms for up to 5 s, then throws `LockTimeoutException`.
+3. **Release** (automatic when the closure finishes, even on exceptions) = `DELETE ... WHERE key = ? AND owner = ?` —
+   only the owner can release it.
+4. The **10-second expiry** is a safety net: if PHP crashes while holding the lock, the next request can take it.
+
+Why a cache lock and not only row locks? Two auto-assigns of **different** tickets lock **different** ticket rows.
+Both would count the same workload and pick the same "least busy" agent. The global lock makes
+"count workload → assign" one operation at a time. Verified: 4 parallel PHP processes auto-assigning 4 tickets gave
+exactly the sequential result, and 0 rows were left in `cache_locks`.
+
+The lock is a coordination tool, **not** the final guarantee: the ticket row lock (`FOR UPDATE`), the status check
+and the `version` check still protect each ticket if the lock ever expired early.
+
+Lock order (deadlock prevention): **cache lock → project row (shared) → ticket row (exclusive) → agent's users row (exclusive, assignment only)**.
+Side effects (Reverb broadcast, email dispatch) are held until the lock is released, so no network call runs while
+holding it. Details: [20-CONCURRENCY-AND-DATA-INTEGRITY.md](20-CONCURRENCY-AND-DATA-INTEGRITY.md).
+
+The scheduler's `withoutOverlapping()` in `routes/console.php` uses the same mechanism (a framework-named lock in
+the same store) so a slow `tickets:check-sla` run is not started twice.
+
+> **বাংলায়:** Atomic lock মানে "একসাথে শুধু একজন" — একটা নির্দিষ্ট নামের তালা। যে আগে `cache_locks` টেবিলে row
+> ঢোকাতে পারে সে তালা পায়, বাকিরা অপেক্ষা করে। PHP হঠাৎ বন্ধ হলেও ১০ সেকেন্ড পর তালা নিজে থেকে খুলে যায়।
+
+Tests: `ConsistencyTest::test_assignment_waits_for_the_lock_and_reports_a_timeout`,
+`test_lock_is_released_after_a_failed_assignment`.
+
+## 15. Email de-duplication keys
+
+`SendTicketEmail::handle()`:
+
+```php
+$cacheKey = $deliveryKey ? 'ticket-email-sent:' . $deliveryKey : null;   // delivery_key = notification UUID
+
+if ($cacheKey !== null && Cache::has($cacheKey)) {
+    Log::info('Ticket email already sent; skipping duplicate attempt', ['delivery_key' => $deliveryKey]);
+    return;
+}
+
+Mail::to($this->recipientEmail)->send(new TicketUpdateMail($this->recipientName, $this->emailData));
+
+if ($cacheKey !== null) {
+    Cache::put($cacheKey, true, now()->addDays(2));
+}
+```
+
+- Purpose: a job retried after a timeout/crash should not send the same email again.
+- Limitation: if the worker crashes **after** SMTP accepted the email but **before** `Cache::put()`, the retry sends
+  it again (queues are at-least-once). `php artisan cache:clear` also removes these keys.
+- Test: `RealtimeAndDeliveryTest::test_retried_email_job_does_not_send_twice`.
+
+## 16. All V2 cache keys at a glance
+
+| Key (without the `resolvedesk-cache-` prefix) | Type | TTL | Written by | Removed by |
+|---|---|---|---|---|
+| `dashboard:admin:stats` | value | 60 s | `DashboardController::adminDashboard()` | ticket services, `ProjectService`, `ProjectController`, `ClientController`, `UserController`, `CategoryController`, seeder |
+| `ticket:active-categories` | value | 3600 s | `Category::activeForDropdown()` | `Category::clearActiveCache()` |
+| `ticket-assignment` | lock (`cache_locks`) | 10 s | `withAssignmentLock()` | `block()` release / expiry |
+| `ticket-email-sent:{uuid}` | value | 2 days | `SendTicketEmail::handle()` | expiry |
+| scheduler overlap lock | lock (`cache_locks`) | until the task ends | `withoutOverlapping()` | framework |
+| rate limiter counters (`ticket-create:{user}` …) | value | 1 min | `throttle:*` middleware | expiry |
+
+Rate limiter counters live in the same cache store — another reason `php artisan cache:clear` resets 429 limits locally.

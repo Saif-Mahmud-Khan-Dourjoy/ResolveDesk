@@ -2,6 +2,7 @@
 
 namespace Tests\Feature;
 
+use App\Jobs\SendTicketEmail;
 use App\Models\Ticket;
 use App\Models\User;
 use App\Notifications\TicketNotification;
@@ -42,7 +43,11 @@ class NotificationTest extends TestCase
         $this->assertSame(1, $this->agent->notifications()->count());
         $this->assertSame(0, $this->customer->notifications()->count(), 'no notification about your own comment');
         $this->assertSame(0, $this->admin->notifications()->count());
-        Queue::assertNothingPushed(); // comments never send emails
+        // V2: a customer's public reply also emails the assigned agent (one job).
+        Queue::assertPushed(SendTicketEmail::class, function ($job) {
+            return $job->recipientEmail === $this->agent->email;
+        });
+        Queue::assertPushed(SendTicketEmail::class, 1);
     }
 
     public function test_agent_reply_notifies_the_creator(): void

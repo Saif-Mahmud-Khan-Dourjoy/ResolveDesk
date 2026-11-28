@@ -1,16 +1,21 @@
 /*
- * ResolveDesk near-real-time notifications (AJAX polling).
+ * ResolveDesk notifications: real-time WebSocket signal + AJAX polling fallback.
  *
- * How it works:
- *  1. Every POLL_INTERVAL_MS the browser asks the server (GET /notifications/feed)
- *     "what is my unread count and what are my latest notifications?"
- *  2. The badge and dropdown are updated without reloading the page.
- *  3. Notifications that are genuinely NEW since the previous poll are shown
- *     as Bootstrap toasts. IDs already shown are remembered, so the same
- *     toast never appears twice.
+ * The DATABASE is the source of truth. Both paths end in the same call:
+ *   GET /notifications/feed  ->  unread count, latest 5, new items since last call
  *
- * This is "polling", not true server push: a new notification appears within
- * a few seconds, not instantly. WebSockets would be the push-based alternative.
+ * Path 1 - real time (V2): resources/js/realtime.js (Laravel Echo + Reverb) listens
+ *   on the private channel "users.{id}". When the server broadcasts
+ *   ".notification.created" it fires the browser event "resolvedesk:realtime-notification"
+ *   and we fetch the feed immediately (instant toast).
+ *
+ * Path 2 - fallback polling (V1 behaviour): while the WebSocket is NOT healthy
+ *   (Reverb stopped, network blocked, assets not built) we poll every
+ *   POLL_INTERVAL_MS. While the WebSocket IS healthy, continuous polling stops.
+ *
+ * After every (re)connection we fetch once, so events missed while disconnected
+ * are not lost. Toasts are de-duplicated by notification ID (shownToastIds), so a
+ * broadcast + a poll for the same notification never show two toasts.
  */
 (function () {
     'use strict';
@@ -40,6 +45,8 @@
     let timerId = null;             // the one and only pending setTimeout
     let isRequestRunning = false;   // prevents two requests at the same time
     let isStopped = false;          // set when the session has expired
+    let fetchAgain = false;         // an update arrived while a request was running
+    let realtimeHealthy = false;    // true while the WebSocket channel is connected + subscribed
     const shownToastIds = new Set();
 
     // =========================================================================
@@ -48,7 +55,11 @@
     // =========================================================================
 
     async function poll() {
-        if (isRequestRunning || isStopped) {
+        if (isStopped) {
+            return;
+        }
+        if (isRequestRunning) {
+            fetchAgain = true; // run once more when the current request finishes
             return;
         }
         isRequestRunning = true;
@@ -92,18 +103,42 @@
             console.warn('Notification polling failed:', error.message);
         } finally {
             isRequestRunning = false;
-            scheduleNextPoll();
+            if (fetchAgain) {
+                fetchAgain = false;
+                poll();
+            } else {
+                scheduleNextPoll();
+            }
         }
     }
 
     function scheduleNextPoll() {
-        if (isStopped) {
-            return;
-        }
         clearTimeout(timerId); // guarantees only one polling loop exists
+        if (isStopped || realtimeHealthy) {
+            return; // WebSocket is healthy: no continuous polling needed
+        }
         const delay = document.hidden ? HIDDEN_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
         timerId = setTimeout(poll, delay);
     }
+
+    // ---- Real-time bridge (events fired by resources/js/realtime.js) ---------
+
+    // Connection state changed: connected+subscribed => stop polling; otherwise fall back.
+    window.addEventListener('resolvedesk:realtime-status', function (event) {
+        const wasHealthy = realtimeHealthy;
+        realtimeHealthy = event.detail.healthy === true;
+
+        if (realtimeHealthy && !wasHealthy) {
+            poll(); // (re)connected: synchronize anything missed while disconnected
+        } else if (!realtimeHealthy && wasHealthy) {
+            scheduleNextPoll(); // WebSocket lost: resume fallback polling
+        }
+    });
+
+    // A new notification exists: fetch the authorized data now (the broadcast only carries an id).
+    window.addEventListener('resolvedesk:realtime-notification', function () {
+        poll();
+    });
 
     // When the user comes back to the tab, fetch immediately.
     document.addEventListener('visibilitychange', function () {

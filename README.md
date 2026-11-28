@@ -1,12 +1,13 @@
-# ResolveDesk — Customer Support & Workflow Automation System
+# ResolveDesk — Multi-Project Customer Support & Workflow Automation System
 
-ResolveDesk is a Laravel 13 helpdesk application. Customers report issues as **tickets**, administrators assign
-them to **support agents** (manually or automatically by workload), agents work through a controlled
-**ticket lifecycle** with **SLA deadlines**, and everyone receives **near-real-time in-app notifications**
-plus **queued email updates**.
+ResolveDesk is a Laravel 13 helpdesk for a software company that supports **several products (projects)**
+used by **several client organizations**. Customers report issues as **tickets**; administrators assign them to
+**support agents** (manually or automatically by workload, limited to agents who support the project); agents work
+through a controlled **ticket lifecycle** with **SLA deadlines**; everyone receives **real-time notifications**
+(WebSockets via Laravel Reverb, with AJAX polling as fallback) plus **queued email updates**.
 
-It is an interview-oriented learning project: the code is deliberately simple, standard Laravel MVC, and every
-important part is explained in [`docs/`](docs/).
+It is an interview-oriented learning project: standard Laravel MVC as a small modular monolith, and every important
+part is explained in [`docs/`](docs/).
 
 > Built with AI assistance (Claude Code) as a learning and interview-preparation project.
 
@@ -14,128 +15,101 @@ important part is explained in [`docs/`](docs/).
 
 ## Business problem
 
-A software company receives support requests through phone, email and chat. Without a central system, issues get
-forgotten, engineers duplicate work, workloads are uneven, deadlines are missed and nobody can see the history.
+A software company sells HRMS, ERP, Payroll and similar products to many client companies. Requests arrive by phone,
+email and chat; without a central system issues get forgotten, engineers duplicate work, workloads are uneven,
+deadlines are missed, one client's data can leak to another, and nobody can see the history.
 
-ResolveDesk provides centralized tickets, role-based access, manual and automatic assignment, a controlled
-status lifecycle, SLA tracking, customer–agent conversation, a full activity history, automatic notifications,
-queued emails and an operational dashboard.
+ResolveDesk provides centralized tickets grouped by project and client, logical client data isolation, role-based
+access, eligibility-aware manual and automatic assignment, a controlled lifecycle, SLA tracking with scheduled breach
+reminders, public replies and staff-only internal notes, secure attachments, a full activity history, real-time
+notifications, queued emails, dashboards and CSV reports.
 
 ## Features
 
 | Area | What it does |
 |---|---|
-| Authentication | Session login/logout, password hashing, login rate limiting (5 attempts/min), session regeneration, inactive users blocked even with an existing session |
-| Roles | `admin`, `agent`, `customer` (one `role` column) — middleware for role areas, `TicketPolicy` for ticket-level rules |
-| Users | List, search, role/status filters, create, view, edit (optional password), activate/deactivate with safety rules |
-| Categories | CRUD, unique names, deactivate instead of delete when in use, cached dropdown |
-| Tickets | Create, list with search + 7 filters + pagination, details, edit (no status changes), `TK-000001` numbers |
-| Workflow | Assign, Auto Assign (least workload), Reassign, Start Working, Resolve (note required), Reopen, Close |
-| SLA | Low 48h · Medium 24h · High 8h · Critical 2h from creation; overdue calculated live |
-| Conversation & audit | Comments (closed tickets are read-only) and a chronological activity timeline |
-| Dashboards | Admin (stats, 3 Chart.js charts, agent workload, avg. resolution time), agent and customer dashboards |
-| Notifications | Database notifications, navbar bell with unread badge, latest 5, history page, read/unread, toasts via AJAX polling every 5 s |
-| Email & queue | One reusable job + mailable + template, database queue, 3 tries / 10 s backoff, dispatched only after commit |
-| Caching | Admin statistics (60 s) and active categories (1 h) with `Cache::remember()` / `Cache::forget()` |
+| Authentication | Session login/logout, hashing, login rate limit (5/min), session regeneration, inactive users blocked even with an existing session |
+| Roles | `admin`, `agent`, `customer` — middleware for role areas, `TicketPolicy` for ticket-level rules |
+| Projects & clients (V2) | CRUD, activate/deactivate (never deleted), project↔client and project↔agent associations with removal guards |
+| Users | Search/filter, customer ↔ client organization, safety rules for deactivation/demotion and organization changes |
+| Ticket scope (V2) | Global or project ticket × internal or client ticket; scope rules per role, enforced on the server |
+| Tickets | Create (with attachments), list with search + 10 filters, details, edit (optimistic locking), `TK-000001` numbers |
+| Workflow | Assign, Auto Assign (least workload among eligible agents), Reassign, Start, Resolve, Reopen, Close |
+| Data integrity (V2) | Transactions with deadlock retry, row locks, `version` column (409 on stale data), global assignment `Cache::lock`, idempotent creation (`request_token`) |
+| Conversation | Public replies + staff-only internal notes, private attachments (5 MB, 5 files, type-checked) |
+| SLA | Low 48h · Medium 24h · High 8h · Critical 2h; remaining time, within/after SLA; `tickets:check-sla` every minute, one reminder per breach |
+| Notifications | Database notifications (source of truth), Reverb private channel `users.{id}`, polling fallback, toasts |
+| Email & queue | One job + mailable + template, after-commit dispatch, 3 tries / 10 s backoff / 60 s timeout, duplicate-send guard |
+| Dashboards & reports | Role dashboards, project/client/SLA-compliance stats, report page + streamed CSV export (formula-injection safe) |
+| Operations | Named rate limiters, request id in logs (`X-Request-Id`), `/up` liveness and `/health/ready` readiness |
 
 ## Technology stack
 
-PHP 8.4.28 · Laravel 13.44 · MySQL-compatible database (developed on **MariaDB 10.4** via XAMPP; MySQL 8 works) ·
-Blade · Bootstrap 5.3 · Bootstrap Icons · Vanilla JavaScript (Fetch API) · Chart.js 4 · PHPUnit 12.
-Database-backed sessions, cache and queue. Frontend libraries are stored locally in `public/vendor/` (works offline,
-no Node.js build step).
+PHP 8.4.28 · Laravel 13.44 · MySQL-compatible database (developed on **MariaDB 10.4** via XAMPP; MySQL 8 compatible) ·
+Blade · Bootstrap 5.3 · Vanilla JavaScript (Fetch API) · Chart.js 4 · Laravel Reverb 1.14 + Laravel Echo 2 (built with
+Vite — only `resources/js/realtime.js`) · database queue, cache, sessions · Laravel Scheduler · PHPUnit 12 · Pint.
+Bootstrap, icons and Chart.js are local files in `public/vendor/` (no build step for them).
 
 ## Architecture
 
-Traditional Laravel MVC monolith with one small service class.
-
 ```
-Browser ─► routes/web.php ─► middleware (auth, active, role) ─► Controller
-                                                              │  Gate::authorize() → TicketPolicy
-                                                              │  $request->validate()
-                                                              ▼
-                                                   TicketService (ticket workflow only)
-                                                   DB::transaction + row lock
-                                                   ├─ Eloquent models → MySQL/MariaDB
-                                                   ├─ TicketActivity (audit trail)
-                                                   ├─ TicketNotification (database)
-                                                   └─ after commit → SendTicketEmail job → jobs table
-                                                                          ▲
-                                         php artisan queue:work ──────────┘ → TicketUpdateMail
+Browser ─► routes/web.php ─► middleware (auth, active, role, throttle) ─► Controller
+                                                                         │ Gate::authorize() → TicketPolicy
+                                                                         │ validation (inline / StoreTicketRequest)
+                                                                         ▼
+          TicketService · TicketAssignmentService · ProjectService · AttachmentService
+          DB::transaction(..., 3) + lockForUpdate + version check (+ Cache::lock for assignment)
+          ├─ Eloquent → MySQL/MariaDB (tickets, activities, notifications, attachments meta)
+          └─ TicketNotifier ── after COMMIT ─┬─► UserNotificationCreated ─► Reverb ─► Echo (private users.{id})
+                                             └─► SendTicketEmail job ─► jobs table ─► queue:work ─► mail
+php artisan schedule:run ─► tickets:check-sla ─► TicketService::processSlaBreach()
 ```
-
-Key files: [`app/Services/TicketService.php`](app/Services/TicketService.php),
-[`app/Policies/TicketPolicy.php`](app/Policies/TicketPolicy.php),
-[`app/Models/Ticket.php`](app/Models/Ticket.php) (all statuses, priorities, SLA hours and transitions),
-[`routes/web.php`](routes/web.php), [`public/js/notifications.js`](public/js/notifications.js).
 
 ## Installation (Windows)
 
 This PC has an older PHP on the global PATH. **Do not change the permanent PATH**; set it per terminal:
 
 ```powershell
-# PowerShell
-$env:Path = "C:\php-8.4.28;$env:Path"
-php -v          # must show 8.4.28
-composer -V     # must say "PHP version 8.4.28"
+$env:Path = "C:\php-8.4.28;$env:Path"   # PowerShell
+php -v; composer -V                      # both must report PHP 8.4.28
 ```
 
 ```bash
-# Git Bash
-export PATH="/c/php-8.4.28:$PATH"
+export PATH="/c/php-8.4.28:$PATH"        # Git Bash
 ```
 
-VS Code already uses PHP 8.4 through [`.vscode/settings.json`](.vscode/settings.json).
-
 1. Start MySQL/MariaDB (XAMPP Control Panel → MySQL → Start).
-2. Create the databases:
-   ```sql
-   CREATE DATABASE resolvedesk CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   CREATE DATABASE resolvedesk_testing CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   ```
+2. Create `resolvedesk` and `resolvedesk_testing` databases (utf8mb4).
 3. Install and configure:
    ```bash
    composer install
-   copy .env.example .env        # (cp on Git Bash) then check DB_* values
+   npm ci && npm run build          # real-time bundle (optional: without it the app falls back to polling)
+   copy .env.example .env           # then set DB_* and generate Reverb values (php artisan reverb:install)
    php artisan key:generate
-   php artisan migrate --seed
+   php artisan migrate --seed       # fresh database only
    ```
+   Upgrading an existing V1 database: back it up, then `php artisan migrate` (8 additive V2 migrations; existing
+   tickets become global tickets). Optional demo projects/clients: `php artisan db:seed --class=V2DemoDataSeeder`.
 
-### Database configuration (`.env`)
-
-```env
-DB_CONNECTION=mysql
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_DATABASE=resolvedesk
-DB_USERNAME=root
-DB_PASSWORD=
-SESSION_DRIVER=database
-QUEUE_CONNECTION=database
-CACHE_STORE=database
-MAIL_MAILER=log
-APP_TIMEZONE=Asia/Dhaka
-```
-
-## Running the application
+## Running locally (four terminals)
 
 ```bash
-php artisan serve            # http://127.0.0.1:8000
-php artisan queue:work       # second terminal: sends queued emails
+php artisan serve           # http://127.0.0.1:8000
+php artisan queue:work      # emails
+php artisan reverb:start    # WebSocket server on :8080 (real-time toasts)
+php artisan schedule:work   # runs tickets:check-sla every minute
 ```
 
-The app works fully without the queue worker; emails simply wait in the `jobs` table until the worker starts.
+Everything keeps working if the worker, Reverb or scheduler is stopped: emails wait in `jobs`, notifications fall back
+to polling, SLA reminders are sent at the next scheduler run. With `MAIL_MAILER=log`, emails go to
+`storage/logs/laravel.log`.
 
-| Queue command | Purpose |
+| Command | Purpose |
 |---|---|
-| `php artisan queue:work` | Start processing jobs |
-| `php artisan queue:work --stop-when-empty` | Process pending jobs then exit |
-| `php artisan queue:failed` | List failed jobs |
-| `php artisan queue:retry all` | Retry failed jobs |
-| `php artisan queue:restart` | Tell running workers to restart after code changes |
-
-With `MAIL_MAILER=log`, emails are written to `storage/logs/laravel.log`. Gmail SMTP setup is in
-[docs/02-SETUP-GUIDE.md](docs/02-SETUP-GUIDE.md) (requires a Google App Password; never commit credentials).
+| `php artisan queue:failed` / `queue:retry all` | Inspect / retry failed jobs |
+| `php artisan tickets:check-sla` | Run the SLA breach check once |
+| `php artisan schedule:list` | Show scheduled tasks |
+| `vendor/bin/pint --dirty` | Format changed PHP files |
 
 ## Demo credentials (local demonstration only)
 
@@ -144,25 +118,28 @@ All seeded accounts use the password **`password`**. Never use these outside a l
 | Role | Email |
 |---|---|
 | Administrator | `admin@resolvedesk.test` |
-| Support agent | `sarah.agent@resolvedesk.test` (also `david.`, `fatima.`, `michael.agent@resolvedesk.test`) |
-| Customer | `john.customer@example.com` (also `emily.`, `rahim.`, `olivia.customer@example.com`) |
-| Inactive customer | `tanvir.customer@example.com` — demonstrates that deactivated users cannot sign in |
+| Support agent | `sarah.agent@resolvedesk.test` (HRMS, PAYROLL) · `david.` (ERP, HRMS) · `fatima.` (PAYROLL, ACCT) · `michael.agent@resolvedesk.test` (ERP, INV) |
+| Customer (ACME) | `john.customer@example.com`, `emily.customer@example.com` |
+| Customer (GLOBEX) | `rahim.customer@example.com` |
+| Standalone customer | `olivia.customer@example.com` (global tickets only) |
+| Inactive customer | `tanvir.customer@example.com` |
 
-Tip: open the agent in a private/incognito window and the admin in a normal window to watch notifications
-arrive without refreshing.
+Client/project links for customers exist only in a freshly seeded database; the existing development database was
+not changed (its customers stay standalone, its tickets stay global).
 
 ## Testing
 
-Tests use the separate `resolvedesk_testing` database (configured in [`phpunit.xml`](phpunit.xml)), so the
-development data is never touched.
+Tests use the separate `resolvedesk_testing` database ([`phpunit.xml`](phpunit.xml)); XAMPP MySQL must be running.
 
 ```bash
 php artisan test                                  # all tests
-php artisan test --filter=TicketWorkflowTest      # one file
-php artisan test --filter=test_auto_assign_picks_agent_with_lowest_workload   # one test
+php artisan test --filter=ConsistencyTest         # one file
 ```
 
-Latest run: **88 tests, 389 assertions, all passing** (see [DEVELOPMENT_PROGRESS.md](DEVELOPMENT_PROGRESS.md)).
+Latest run (2026-11-26 production-readiness audit): **170 tests, 682 assertions, all passing** — including
+two-process MySQL race tests. Multi-process HTTP concurrency and a live Reverb end-to-end check were also run; see
+[docs/PRODUCTION-READINESS-REPORT.md](docs/PRODUCTION-READINESS-REPORT.md) for what was and was not verified.
+Study order for the source code: [docs/CODEBASE-LEARNING-MAP.md](docs/CODEBASE-LEARNING-MAP.md).
 
 ## Documentation
 
@@ -175,7 +152,7 @@ Latest run: **88 tests, 389 assertions, all passing** (see [DEVELOPMENT_PROGRESS
 | 05 | [Module-wise code explanation](docs/05-MODULE-WISE-CODE-EXPLANATION.md) |
 | 06 | [Business logic guide](docs/06-BUSINESS-LOGIC-GUIDE.md) |
 | 07 | [UI-to-backend mapping](docs/07-UI-TO-BACKEND-MAPPING.md) |
-| 08 | [Live coding practice (35+ exercises)](docs/08-LIVE-CODING-PRACTICE.md) |
+| 08 | [Live coding practice](docs/08-LIVE-CODING-PRACTICE.md) |
 | 09 | [Interview questions and answers](docs/09-INTERVIEW-QUESTIONS-AND-ANSWERS.md) |
 | 10 | [System design guide](docs/10-SYSTEM-DESIGN-GUIDE.md) |
 | 11 | [Debugging guide](docs/11-DEBUGGING-GUIDE.md) |
@@ -185,30 +162,34 @@ Latest run: **88 tests, 389 assertions, all passing** (see [DEVELOPMENT_PROGRESS
 | 15 | [Caching](docs/15-CACHING-GUIDE.md) |
 | 16 | [Codebase learning map](docs/16-CODEBASE-LEARNING-MAP.md) |
 | 17 | [Demo and interview guide](docs/17-DEMO-AND-INTERVIEW-GUIDE.md) |
+| 18 | [Production deployment](docs/18-PRODUCTION-DEPLOYMENT.md) |
+| 19 | [Backup and recovery](docs/19-BACKUP-AND-RECOVERY.md) |
+| 20 | [Concurrency and data integrity](docs/20-CONCURRENCY-AND-DATA-INTEGRITY.md) |
+| 21 | [Real-time: Reverb and Echo](docs/21-REALTIME-REVERB-ECHO.md) |
+| 22 | [V2 business features](docs/22-V2-BUSINESS-FEATURES.md) |
+| 23 | [Security, errors, logging, operations](docs/23-SECURITY-ERRORS-LOGGING-OPERATIONS.md) |
 
-Start with **16 (learning map)**, then **07 (UI-to-backend mapping)** and **06 (business logic)**.
+Bangla Word guides: [project explanation](docs/ResolveDesk-Project-Explanation-Bangla.docx) and
+[full process guide, UI → backend → database](docs/ResolveDesk-Process-Guide-UI-to-Database-Bangla.docx).
+
+Start with **16 (learning map)**, then **22 (V2 features)**, **07 (UI-to-backend mapping)** and **20 (concurrency)**.
 
 ## Known limitations
 
-- Notifications use **AJAX polling** (every 5 s, 30 s in hidden tabs) — near-real-time, not server push.
-- Auto-assignment locks the ticket row, but two *different* tickets auto-assigned at the same moment may both
-  pick the same least-busy agent. This is application-level workload distribution, not infrastructure load balancing.
-- SLA uses continuous calendar hours (no business hours/holidays). Reopened tickets keep their original deadline,
-  so they can be overdue immediately (deliberate simplification). No scheduled SLA escalation.
-- Average resolution time measures creation → latest resolution, even if the ticket was reopened.
-- Resolved tickets cannot be reassigned, so an agent who still owns resolved tickets can only be deactivated after
-  those tickets are closed (an admin can close them).
-- Queue retries can occasionally send a duplicate email (no idempotency tracking).
-- The database cache still queries the database; it only saves the expensive aggregate queries.
-- `TIMESTAMPDIFF` / `DATE()` in the dashboard are MySQL/MariaDB functions (SQLite is not supported).
-- Developed and tested on MariaDB 10.4 because MySQL 8 is not installed on the development PC.
-- Visual browser rendering and toast pop-ups were checked through HTTP/feature tests only, not with browser
-  automation; Gmail SMTP delivery was not tested (log mailer used).
+- Developed and tested on MariaDB 10.4 (MySQL 8 not installed); no real-browser visual test, no Linux deployment,
+  no SMTP delivery and no backup-restore drill were performed.
+- Timestamps are stored in `Asia/Dhaka`, not UTC (V1 data was stored that way; rewriting it was avoided).
+- Single Reverb server; several open tabs each show the toast. Polling fallback latency is up to 5 s.
+- The assignment lock is global and time-limited; it coordinates workload, while row locks and status/version checks
+  protect each ticket.
+- Email de-duplication is best effort (queues are at-least-once; SMTP has no exactly-once).
+- Resolved tickets cannot be reassigned, so an agent with Resolved tickets must have them closed before removal or
+  deactivation. A customer's organization cannot change after they created client tickets.
+- No antivirus scanning of uploads; SLA uses calendar hours; reopened tickets keep their original deadline.
 
 ## Security notes
 
-CSRF tokens on every form and AJAX POST, escaped Blade output (`{{ }}`) and `textContent` in JavaScript (XSS),
-Eloquent parameter binding (SQL injection), `$fillable` mass-assignment protection, server-side validation,
-backend authorization on every action (policies + middleware), foreign-key constraints, users/tickets are never
-hard-deleted. `.env` is git-ignored. For production set `APP_ENV=production`, `APP_DEBUG=false`, a strong DB
-password, real SMTP credentials via environment variables, and run the queue worker under a process manager.
+CSRF on all forms/AJAX, escaped Blade output and `textContent` (XSS), Eloquent bindings (SQL injection), explicit
+`$fillable`, server-side validation and policies on every action, private broadcast channels, private attachment
+disk with authorized downloads, CSV formula-injection protection, rate limiting, request-id logging without secrets.
+`.env` is git-ignored. Production configuration: [docs/18](docs/18-PRODUCTION-DEPLOYMENT.md) and [docs/23](docs/23-SECURITY-ERRORS-LOGGING-OPERATIONS.md).

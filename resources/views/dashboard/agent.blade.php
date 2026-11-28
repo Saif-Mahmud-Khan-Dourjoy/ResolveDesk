@@ -24,7 +24,10 @@
     <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'Resolved / closed', 'value' => $counts['resolved'], 'icon' => 'bi-check2-circle', 'color' => 'success'])
     </div>
-    <div class="col-12 col-lg">
+    <div class="col-6 col-lg">
+        @include('dashboard._stat-card', ['label' => 'My workload (Assigned + In Progress)', 'value' => $counts['workload'], 'icon' => 'bi-speedometer', 'color' => 'secondary'])
+    </div>
+    <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'Overdue', 'value' => $counts['overdue'], 'icon' => 'bi-alarm', 'color' => 'danger', 'link' => route('tickets.index', ['overdue' => 1])])
     </div>
 </div>
@@ -71,6 +74,8 @@
                 @endforelse
             </ul>
         </div>
+
+        @include('dashboard._recent-activity', ['activities' => $recentActivity])
     </div>
 </div>
 @endsection

@@ -18,7 +18,7 @@
 <div class="card mb-3">
     <div class="card-body">
         <form method="GET" action="{{ route('users.index') }}" class="row g-2 align-items-end">
-            <div class="col-md-5">
+            <div class="col-md-3">
                 <label for="search" class="form-label small mb-1">Search</label>
                 <input type="text" id="search" name="search" value="{{ request('search') }}" class="form-control" placeholder="Name or email">
             </div>
@@ -39,6 +39,15 @@
                     <option value="inactive" @selected(request('status') === 'inactive')>Inactive</option>
                 </select>
             </div>
+            <div class="col-6 col-md-2">
+                <label for="client_id" class="form-label small mb-1">Client</label>
+                <select id="client_id" name="client_id" class="form-select">
+                    <option value="">All</option>
+                    @foreach ($clients as $client)
+                        <option value="{{ $client->id }}" @selected((string) request('client_id') === (string) $client->id)>{{ $client->code }}</option>
+                    @endforeach
+                </select>
+            </div>
             <div class="col-md-3 d-flex gap-2">
                 <button type="submit" class="btn btn-primary"><i class="bi bi-funnel me-1"></i> Filter</button>
                 <a href="{{ route('users.index') }}" class="btn btn-outline-secondary">Reset</a>
@@ -51,7 +60,7 @@
     <div class="table-responsive">
         <table class="table table-hover align-middle table-card">
             <thead>
-                <tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Created</th><th class="text-end">Actions</th></tr>
+                <tr><th>Name</th><th>Email</th><th>Role</th><th>Client</th><th>Status</th><th>Created</th><th class="text-end">Actions</th></tr>
             </thead>
             <tbody>
                 @forelse ($users as $user)
@@ -59,6 +68,7 @@
                         <td class="fw-semibold"><a href="{{ route('users.show', $user) }}" class="text-decoration-none">{{ $user->name }}</a></td>
                         <td>{{ $user->email }}</td>
                         <td><span class="badge text-bg-light border">{{ $user->roleLabel() }}</span></td>
+                        <td class="small">{{ $user->client?->code ?? '—' }}</td>
                         <td>
                             @if ($user->is_active)
                                 <span class="badge bg-success-subtle text-success-emphasis">Active</span>
@@ -83,7 +93,7 @@
                         </td>
                     </tr>
                 @empty
-                    <tr><td colspan="6" class="text-center text-muted py-4">No users found.</td></tr>
+                    <tr><td colspan="7" class="text-center text-muted py-4">No users found.</td></tr>
                 @endforelse
             </tbody>
         </table>

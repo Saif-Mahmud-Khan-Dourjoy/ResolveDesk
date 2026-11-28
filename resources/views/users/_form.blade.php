@@ -51,4 +51,19 @@
         </div>
     </div>
 </div>
+<div class="row">
+    <div class="col-md-6 mb-3">
+        <label for="client_id" class="form-label">Client organization <span class="text-muted small">(customers only)</span></label>
+        <select id="client_id" name="client_id" class="form-select @error('client_id') is-invalid @enderror">
+            <option value="">— Standalone customer / not applicable —</option>
+            @foreach ($clients as $client)
+                <option value="{{ $client->id }}" @selected((string) old('client_id', $user?->client_id) === (string) $client->id)>
+                    {{ $client->code }} - {{ $client->name }}{{ $client->is_active ? '' : ' (inactive)' }}
+                </option>
+            @endforeach
+        </select>
+        <div class="form-text">Ignored for administrators and agents. Standalone customers can only create global tickets.</div>
+        @error('client_id')<div class="invalid-feedback">{{ $message }}</div>@enderror
+    </div>
+</div>
 @error('is_active')<div class="alert alert-danger small">{{ $message }}</div>@enderror

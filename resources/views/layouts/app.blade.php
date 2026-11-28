@@ -6,6 +6,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     {{-- JavaScript reads this token and sends it with POST requests (CSRF protection). --}}
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    {{-- V2: realtime.js subscribes to the private channel users.{this id}. The server
+         still checks that the logged-in user owns the channel (routes/channels.php). --}}
+    <meta name="user-id" content="{{ auth()->id() }}">
     <title>@yield('title', 'Dashboard') · ResolveDesk</title>
 
     {{-- Local copies of Bootstrap, Bootstrap Icons and our own CSS (works offline). --}}
@@ -43,6 +46,11 @@
 <script src="{{ asset('vendor/bootstrap/bootstrap.bundle.min.js') }}"></script>
 <script src="{{ asset('js/app.js') }}"></script>
 <script src="{{ asset('js/notifications.js') }}"></script>
+{{-- V2 real-time bundle (Echo + Reverb), built with `npm run build`. If it was never built,
+     the page still works: notifications.js simply keeps polling. --}}
+@if (file_exists(public_path('build/manifest.json')) || file_exists(public_path('hot')))
+    @vite('resources/js/realtime.js')
+@endif
 @stack('scripts')
 </body>
 </html>

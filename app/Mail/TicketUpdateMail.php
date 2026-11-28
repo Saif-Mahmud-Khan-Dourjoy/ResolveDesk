@@ -15,8 +15,7 @@ class TicketUpdateMail extends Mailable
     public function __construct(
         public string $recipientName,
         public array $emailData,
-    ) {
-    }
+    ) {}
 
     public function envelope(): Envelope
     {
@@ -36,6 +35,8 @@ class TicketUpdateMail extends Mailable
                 'eventTitle' => $this->emailData['event_title'],
                 'eventMessage' => $this->emailData['event_message'],
                 'statusLabel' => $this->emailData['status'],
+                // V2: project name (null for global tickets; older queued jobs may not have it).
+                'projectName' => $this->emailData['project'] ?? null,
                 // The link only opens the ticket after login + TicketPolicy@view,
                 // so the email itself never grants access.
                 'ticketUrl' => route('tickets.show', $this->emailData['ticket_id']),

@@ -7,6 +7,23 @@ block by block with snippets copied from the real files.
 Read [04 — Laravel MVC Guide](04-LARAVEL-MVC-GUIDE.md) first if words like *middleware*, *policy*,
 *route model binding* or *flash message* are new to you.
 
+**Updated for V2** (multi-project upgrade, `V2_MASTER_PROMPT.md`). What changed in the code you will read here:
+
+| V1 | V2 |
+|---|---|
+| `TicketService` did everything | `TicketService` (create, edit, comments, lifecycle, SLA), **`TicketAssignmentService`** (assign, auto-assign, eligibility, assignment lock), **`TicketNotifier`** (database notification + after-commit broadcast + after-commit email), **`AttachmentService`** (private files), **`ProjectService`** (project associations) |
+| private `TicketService::recordActivity()` | static `TicketActivity::record()` (also for system actions, `user_id = NULL`) |
+| private `notifyUser()` / `queueEmail()` | `TicketNotifier::notify()` / `notifyAdmins()` / private `queueEmail()` |
+| `TicketController::agentList()` | `TicketAssignmentService::eligibleAgents($ticket)` (+ private `activeAgents()` for the list filter) |
+| filters inside `index()` | `public static TicketController::applyFilters()` (shared with `ReportController`) |
+| `store(Request)` | `store(StoreTicketRequest)` with `request_token` (idempotency) and attachments |
+| no version | hidden `version` field on every ticket mutation form (optimistic locking) |
+| no email for comments | a **customer's public reply emails the assigned agent** |
+| — | projects, clients, internal notes, attachments, SLA command, reports/CSV, rate limiters, Reverb |
+
+The detailed business explanation of the V2 features (with six operations in the 30-question format) is in
+[22 — V2 business features](22-V2-BUSINESS-FEATURES.md).
+
 Other related guides: [Database](03-DATABASE-GUIDE.md) · [Business logic](06-BUSINESS-LOGIC-GUIDE.md) ·
 [UI to backend](07-UI-TO-BACKEND-MAPPING.md) · [Debugging](11-DEBUGGING-GUIDE.md) ·
 [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) · [Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) ·
@@ -23,13 +40,16 @@ Other related guides: [Database](03-DATABASE-GUIDE.md) · [Business logic](06-BU
 4. [Tickets: create, list/filter, show, edit](#4-tickets-create-listfilter-show-edit)
 5. [Assignment: manual, automatic, reassignment](#5-assignment-manual-automatic-reassignment)
 6. [Lifecycle: start, resolve, reopen, close](#6-lifecycle-start-resolve-reopen-close)
-7. [Comments](#7-comments)
+7. [Comments, internal notes and attachments](#7-comments-internal-notes-and-attachments)
 8. [Activity history](#8-activity-history)
 9. [Dashboards](#9-dashboards)
 10. [Notifications](#10-notifications)
 11. [Email and queue](#11-email-and-queue)
 12. [Caching](#12-caching)
 13. [Known issues and limitations found while writing this document](#13-known-issues-and-limitations-found-while-writing-this-document)
+14. [Projects and client organizations (V2)](#14-projects-and-client-organizations-v2)
+15. [SLA breach reminders (V2)](#15-sla-breach-reminders-v2)
+16. [Reports and CSV export (V2)](#16-reports-and-csv-export-v2)
 
 ---
 
@@ -61,9 +81,9 @@ flowchart LR
     C --> D["Gate::authorize (TicketPolicy)"]
     D --> E["$request->validate"]
     E --> F["TicketService method"]
-    F --> G["DB::transaction + lockTicket"]
-    G --> H["save + recordActivity + notifyUser"]
-    H --> I["COMMIT, afterCommit: queue email"]
+    F --> G["DB::transaction(..., 3) + lockTicket + ensureVersion"]
+    G --> H["save (version+1) + TicketActivity::record + TicketNotifier::notify"]
+    H --> I["COMMIT, afterCommit: broadcast + queue email"]
     I --> J["clearDashboardCache"]
     J --> K["back()->with('success')"]
 ```
@@ -71,14 +91,17 @@ flowchart LR
 `TicketService` class comment (copied from `app/Services/TicketService.php`):
 
 ```php
- * Every method follows the same pattern:
- *   1. DB::transaction(): all database changes succeed together or are all rolled back.
- *   2. lockTicket(): SELECT ... FOR UPDATE so two people cannot change the same ticket at once.
- *   3. Re-check the business rule on the freshly locked row.
- *   4. Save, record activity, create database notification (same transaction).
- *   5. Emails are queued only AFTER the transaction commits (queueEmail()).
- *   6. Clear the admin dashboard cache after a successful commit.
+ * Every mutating method follows the same pattern:
+ *   1. DB::transaction(..., 3): all changes succeed together or are rolled back;
+ *      the "3" retries the transaction if MySQL reports a deadlock.
+ *   2. lockTicket(): SELECT ... FOR UPDATE, so we validate the CURRENT row,
+ *      not the possibly stale model from route model binding.
+ *   3. ensureVersion(): optimistic check of the version the user saw (409 on mismatch).
+ *   4. Change the ticket, version + 1, record activity, create notifications.
+ *   5. After COMMIT: emails/broadcasts (TicketNotifier) and cache invalidation.
 ```
+
+Assignment adds one more outer step (a `Cache::lock`, section 5).
 
 ### 0.3 PHP syntax used in this project (quick reference)
 
@@ -87,7 +110,7 @@ flowchart LR
 | Constructor property promotion | `public function __construct(private TicketService $ticketService) {}` (`TicketController`) | Declares a property **and** assigns the constructor argument in one step (PHP 8.0). |
 | Typed properties | `public int $tries = 3;` (`SendTicketEmail`) | The property may only hold an `int`. |
 | Return types | `public function canPerform(string $action): bool` | The method must return a `bool`. `: void` = returns nothing. `: ?User` = a `User` **or** `null`. |
-| Nullable parameter types | `private function notifyUser(?User $recipient, ...)` | `?User` accepts a `User` or `null`. |
+| Nullable parameter types | `public function notify(?User $recipient, Ticket $ticket, ?User $actor, ...)` (`TicketNotifier`) | `?User` accepts a `User` or `null`. |
 | Class constants | `public const STATUS_OPEN = 'open';`, `private const PER_PAGE = 15;` | Fixed values; read with `Ticket::STATUS_OPEN` or `self::PER_PAGE` inside the class. |
 | `::class` | `TicketController::class` | The full class name as a string. |
 | Named arguments | `new Envelope(subject: '...')`, `new Content(view: 'emails.ticket-update', with: [...])` (`TicketUpdateMail`) | Pass arguments by parameter name instead of position (PHP 8.0). |
@@ -323,18 +346,18 @@ All routes are inside `Route::middleware('role:admin')`. Users are **never delet
 | 1 | Business purpose | Admin finds users quickly. |
 | 2 | User roles | Admin. |
 | 3 | UI page | Users. |
-| 4 | UI actions | Search, Role filter, Status filter, **Filter**, **Reset**, View, Edit, Activate/Deactivate. |
+| 4 | UI actions | Search, Role filter, Status filter, V2 Client filter, **Filter**, **Reset**, View, Edit, Activate/Deactivate. |
 | 5 | Blade | `users/index.blade.php` |
 | 6 | On click | GET form submits filters in the URL query string. |
-| 7 | Form data | `search`, `role`, `status` (`active` / `inactive`). |
+| 7 | Form data | `search`, `role`, `status` (`active` / `inactive`), V2 `client_id`. |
 | 8 | Method + URL | `GET /users?search=sarah&role=agent&status=active` |
 | 9 | Route | `users.index` |
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `UserController::index(Request $request)` |
-| 12 | Validation | None (filters only use bound parameters; unknown values just return no rows). |
+| 12 | Validation | V2: `search` max 100, `role` in `User::ROLES`, `status` in active/inactive, `client_id` integer. |
 | 13 | Authorization | `role:admin` |
 | 14 | Business logic | Build query step by step only for filled filters. |
-| 15 | Eloquent | `User::query()->where(function ($subQuery) use ($search) {...})->where('role', ...)->where('is_active', true)->orderBy('name')->paginate(15)->withQueryString()` |
+| 15 | Eloquent | `User::with('client')->where(function ($subQuery) use ($search) {...})->where('role', ...)->where('client_id', ...)->where('is_active', true)->orderBy('name')->paginate(15)->withQueryString()` |
 | 16 | SQL | `SELECT COUNT(*) AS aggregate FROM users WHERE (name LIKE '%sarah%' OR email LIKE '%sarah%') AND role = 'agent' AND is_active = 1;` then `SELECT * FROM users WHERE (...) AND role = 'agent' AND is_active = 1 ORDER BY name ASC LIMIT 15 OFFSET 0;` |
 | 17 | DB changes | — |
 | 18–20 | — | — |
@@ -368,15 +391,15 @@ would break the other filters: `WHERE name LIKE ? OR email LIKE ? AND role = ?` 
 | 4 | UI actions | Fill form, **Create User**, Cancel. |
 | 5 | Blade | `users/create.blade.php` + `users/_form.blade.php` |
 | 6 | On click | POST form. |
-| 7 | Form data | `name`, `email`, `password`, `password_confirmation`, `role`, `is_active` (checkbox, `1` or missing). |
+| 7 | Form data | `name`, `email`, `password`, `password_confirmation`, `role`, `is_active` (checkbox, `1` or missing), V2 `client_id` ("customers only"). |
 | 8 | Method + URL | `GET /users/create` (form), `POST /users` (save) |
 | 9 | Route | `users.create`, `users.store` |
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `UserController::create()`, `UserController::store(Request $request)` |
-| 12 | Validation | `name` required max 255; `email` required, email, `unique:users,email`; `password` required min 8 `confirmed`; `role` `Rule::in(array_keys(User::ROLES))`; `is_active` boolean. |
+| 12 | Validation | `name` required max 255; `email` required, email, `unique:users,email`; `password` required min 8 `confirmed`; `role` `Rule::in(array_keys(User::ROLES))`; `is_active` boolean; V2 `client_id` nullable integer `Rule::exists('clients', 'id')->where('is_active', true)` ("Please choose an active client organization."). |
 | 13 | Authorization | `role:admin` |
-| 14 | Business logic | `$validated['is_active'] = $request->boolean('is_active');` (unchecked checkbox is not sent). |
-| 15 | Eloquent | `User::create($validated)` — mass assignment limited by `$fillable`; password hashed by the `'hashed'` cast. |
+| 14 | Business logic | `$validated['is_active'] = $request->boolean('is_active');` (unchecked checkbox is not sent). V2: `client_id` is kept only for customers (`$validated['role'] === User::ROLE_CUSTOMER ? ... : null`) and set explicitly (not fillable). Dashboard cache cleared. |
+| 15 | Eloquent | `$user = new User($validated); $user->client_id = $clientId; $user->save();` — mass assignment limited by `$fillable`; password hashed by the `'hashed'` cast. |
 | 16 | SQL | `SELECT COUNT(*) AS aggregate FROM users WHERE email = ?;` then `INSERT INTO users (name, email, password, role, is_active, updated_at, created_at) VALUES (?, ?, '$2y$12$...', 'agent', 1, NOW(), NOW());` |
 | 17 | DB changes | One `users` row. |
 | 18–20 | — | — |
@@ -415,7 +438,7 @@ default `true` (new users are active by default).
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `UserController::show(User $user)` (route model binding) |
 | 12–13 | Validation / Authorization | — / `role:admin` |
-| 14 | Business logic | Count created tickets, count current workload (`WORKLOAD_STATUSES`), last 10 related tickets. |
+| 14 | Business logic | V2 `$user->load(['client', 'projects'])` (client link for customers, "Supported projects" for agents); count created tickets, count current workload (`WORKLOAD_STATUSES`), last 10 related tickets. |
 | 15 | Eloquent | `$user->createdTickets()->count()`, `$user->assignedTickets()->whereIn('status', Ticket::WORKLOAD_STATUSES)->count()`, `Ticket::with([...])->where(function ...)->latest()->take(10)->get()` |
 | 16 | SQL | `SELECT COUNT(*) FROM tickets WHERE created_by = 5 AND created_by IS NOT NULL;` · `SELECT COUNT(*) FROM tickets WHERE assigned_to = 5 AND assigned_to IS NOT NULL AND status IN ('assigned','in_progress');` · `SELECT * FROM tickets WHERE (created_by = 5 OR assigned_to = 5) ORDER BY created_at DESC LIMIT 10;` + eager loads |
 | 17–20 | — | — |
@@ -435,14 +458,14 @@ default `true` (new users are active by default).
 | 4 | UI actions | **Save Changes**, Cancel. |
 | 5 | Blade | `users/edit.blade.php` (`@method('PUT')`) + `users/_form.blade.php` |
 | 6 | On click | POST with `_method=PUT`. |
-| 7 | Form data | `name`, `email`, `password` (optional), `password_confirmation`, `role`, `is_active`, `_method`. |
+| 7 | Form data | `name`, `email`, `password` (optional), `password_confirmation`, `role`, `is_active`, V2 `client_id`, `_method`. |
 | 8 | Method + URL | `PUT /users/{user}` |
 | 9 | Route | `users.update` |
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `UserController::update(Request $request, User $user)` |
 | 12 | Validation | `Rule::unique('users', 'email')->ignore($user->id)`; `'password' => ['nullable', 'string', 'min:8', 'confirmed']` |
-| 13 | Authorization | `role:admin` + business rules in `ensureRoleOrStatusChangeIsAllowed()` |
-| 14 | Business logic | 3 rules (below). Empty password → keep the current one. |
+| 13 | Authorization | `role:admin` + business rules in `ensureRoleOrStatusChangeIsAllowed()` and V2 `ensureClientChangeIsAllowed()` |
+| 14 | Business logic | 3 rules (below) + V2 client rule. Empty password → keep the current one. |
 | 15 | Eloquent | `$user->update($validated)` |
 | 16 | SQL | `UPDATE users SET name = ?, role = ?, updated_at = ? WHERE id = ?;` (only changed columns) |
 | 17 | DB changes | One `users` row. |
@@ -498,6 +521,11 @@ if ($user->isAgent()) {
 
 (The `throw` bodies are shortened here; see the file for the exact messages.)
 
+**V2 client rule** (`ensureClientChangeIsAllowed($user, $newClientId)`): a new client must be active, and a
+customer who already created client tickets (`Ticket::where('created_by', $user->id)->whereNotNull('client_id')->count()`)
+cannot change organization or stop being a customer — moving them would let them keep seeing the old
+organization's tickets. Full code and reasoning: [22 — section 3](22-V2-BUSINESS-FEATURES.md#3-customer-to-client-mapping-rules).
+
 - Rule 2 SQL: `SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1 AND id != 1;`
 - Rule 3 includes **Resolved** tickets because a customer can **reopen** them, and a reopened ticket goes back to
   its assigned agent, who must be active (see `TicketService::reopen`). Resolved tickets cannot be reassigned, so
@@ -533,7 +561,7 @@ if ($user->isAgent()) {
 | 24 | Files | `UserController.php`, `public/js/app.js`, `tests/Feature/UserAndCategoryManagementTest.php` |
 | 25 | Modifications | Write an audit row when a user is deactivated (new table or log). |
 
-`public/js/app.js` (used by every `data-confirm` form in the project):
+`public/js/app.js` (used by every `data-confirm` / `data-disable-on-submit` form in the project):
 
 ```js
 document.addEventListener('submit', function (event) {
@@ -542,11 +570,23 @@ document.addEventListener('submit', function (event) {
 
     if (message && !window.confirm(message)) {
         event.preventDefault();
+        return;
+    }
+
+    if (form.hasAttribute('data-disable-on-submit')) {
+        if (form.dataset.submitting === '1') {
+            event.preventDefault(); // second click while the first request is still running
+            return;
+        }
+        form.dataset.submitting = '1';
+        ...
     }
 });
 ```
 
-One listener on the whole document (**event delegation**) instead of one listener per form.
+One listener on the whole document (**event delegation**) instead of one listener per form. V2 added the
+double-submit part (buttons disabled + spinner, re-enabled on `pageshow` after the Back button). It is only a
+convenience: the server-side protection against duplicate tickets is `request_token`.
 
 ---
 
@@ -686,75 +726,156 @@ validates against the real `categories` table (`Rule::exists('categories', 'id')
 
 ## 4. Tickets: create, list/filter, show, edit
 
-Files: `app/Http/Controllers/TicketController.php`, `app/Services/TicketService.php`, `app/Models/Ticket.php`,
-`app/Policies/TicketPolicy.php`, `resources/views/tickets/*.blade.php`, `resources/views/partials/ticket-badges.blade.php`.
+Files: `app/Http/Controllers/TicketController.php`, `app/Http/Requests/StoreTicketRequest.php` (V2),
+`app/Services/TicketService.php`, `app/Services/AttachmentService.php` (V2), `app/Models/Ticket.php`,
+`app/Policies/TicketPolicy.php`, `resources/views/tickets/*.blade.php`, `public/js/ticket-form.js` (V2),
+`resources/views/partials/ticket-badges.blade.php`.
 
 ### 4.1 Operation: Create a ticket
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Report a problem. The system sets the number, status and SLA deadline. |
-| 2 | User roles | All active roles (`TicketPolicy::create` returns `true`). Normally customers. |
+| 1 | Business purpose | Report a problem, optionally for a project and (admin) a client organization. The system sets the number, status, SLA deadline and scope. |
+| 2 | User roles | All active roles (`TicketPolicy::create`), except customers whose client organization is inactive. Scope rules differ per role (V2). |
 | 3 | UI page | Create Ticket. |
-| 4 | UI actions | Fill subject, description, category, priority → **Submit Ticket**; Cancel. |
-| 5 | Blade | `tickets/create.blade.php` + `tickets/_form.blade.php` |
-| 6 | On click | POST form. |
-| 7 | Form data | `subject`, `description`, `category_id`, `priority`. |
+| 4 | UI actions | (Admin) choose Client → project list reloads; choose Project (or "Global"); subject, description, category, priority, optional attachments → **Submit Ticket**; Cancel. |
+| 5 | Blade | `tickets/create.blade.php` + `tickets/_scope-fields.blade.php` + `tickets/_form.blade.php` + `tickets/_attachment-input.blade.php` |
+| 6 | On click | `multipart/form-data` POST; `public/js/app.js` disables the button (`data-disable-on-submit`). |
+| 7 | Form data | `request_token` (hidden UUID), `client_id` (admin only), `project_id`, `subject`, `description`, `category_id`, `priority`, `attachments[]`. |
 | 8 | Method + URL | `GET /tickets/create` (form) · `POST /tickets` (save) |
 | 9 | Route | `tickets.create`, `tickets.store` |
-| 10 | Middleware | `auth`, `active` |
-| 11 | Controller | `TicketController::create()`, `TicketController::store(Request $request)` |
-| 12 | Validation | `subject` required string max 255 · `description` required string max 5000 · `category_id` required integer `Rule::exists('categories', 'id')->where('is_active', true)` · `priority` `Rule::in(array_keys(Ticket::PRIORITIES))` · custom message `'category_id.exists' => 'Please choose an active category.'` |
-| 13 | Authorization | `Gate::authorize('create', Ticket::class)` |
-| 14 | Business logic | `TicketService::createTicket()`: status Open, unassigned, `due_at = created_at + SLA hours`, ticket number from id, activity "created", then a "New ticket created" notification to every active admin. |
-| 15 | Eloquent | `new Ticket()`, `fill()`, `save()` ×2, `TicketActivity::create()`, `User::where('role', User::ROLE_ADMIN)->where('is_active', true)->get()`, `$admin->notify(...)` |
+| 10 | Middleware | `auth`, `active`; store also `throttle:ticket-create` (10/min) |
+| 11 | Controller | `TicketController::create(Request $request)`, `TicketController::store(StoreTicketRequest $request)` |
+| 12 | Validation | `StoreTicketRequest::rules()`: subject required max 255 · description required max 5000 · `category_id` `Rule::exists('categories', 'id')->where('is_active', true)` · priority in `Ticket::PRIORITIES` · `project_id` / `client_id` nullable integer exists · `request_token` required uuid · `AttachmentService::validationRules()`. |
+| 13 | Authorization | `StoreTicketRequest::authorize()` → `$this->user()->can('create', Ticket::class)`; scope ownership in `TicketService::resolveScope()`. |
+| 14 | Business logic | Idempotency check → store files → transaction: `resolveScope()` → INSERT (status open, version 1, `due_at`) → ticket number → activity → attachment rows → notify admins → after commit: clear dashboard cache. |
+| 15 | Eloquent | `Ticket::where('created_by', ...)->where('request_token', ...)->first()`, `Project::whereKey()->sharedLock()->first()`, `$project->clients()->where(...)->exists()`, `new Ticket`, `fill()`, `save()` ×2, `TicketActivity::record()`, `TicketAttachment` saves, `$admin->notify()` |
 | 16 | SQL | see below |
-| 17 | DB changes | 1 `tickets` row, 1 `ticket_activities` row, 1 `notifications` row per active admin (except the creator); after COMMIT 1 `jobs` row per notified admin. |
-| 18 | Notification | "New ticket created" (`event_type` `created`) to every **active admin**, except an admin who created the ticket themselves (`notifyUser()` skips the actor). Agents and the creator get nothing. Added at the project owner's request, beyond the original MASTER_PROMPT §9.2 matrix. |
-| 19 | Queue | One `SendTicketEmail` job per notified admin, pushed after COMMIT (`queueEmail()` → `DB::afterCommit()`). |
-| 20 | Cache | Form: reads `ticket:active-categories` via `Category::activeForDropdown()`. After save: `clearDashboardCache()` → forget `dashboard:admin:stats`. |
-| 21 | Response | `redirect()->route('tickets.show', $ticket)->with('success', "Ticket {$ticket->ticket_number} was created successfully.")` |
-| 22 | Blade | Ticket details page with green flash. |
-| 23 | Errors | Missing fields / inactive category → back with `@error` + `old()`. Database error → transaction rolled back, 500 page. |
-| 24 | Files | `TicketController.php`, `TicketService.php`, `Ticket.php`, `tickets/_form.blade.php`, `tests/Feature/TicketManagementTest.php`, `tests/Feature/QueueAndEmailTest.php` |
-| 25 | Modifications | Add a new priority (add to `PRIORITIES` **and** `SLA_HOURS`); make the admin alert in-app only (change the last `notifyUser()` argument from `true` to `false`). |
+| 17 | DB changes | 1 `tickets` row, 1–2 `ticket_activities`, 0–5 `ticket_attachments`, 1 `notifications` per active admin (except the creator); after COMMIT 1 `jobs` row per notified admin. |
+| 18 | Notification | "New ticket created" (`created`) to every active admin except an admin creator (`TicketNotifier::notifyAdmins()` → `notify()` skips the actor). |
+| 19 | Queue | One `SendTicketEmail` per notified admin, after COMMIT (`TicketNotifier`). Broadcast `notification.created` after COMMIT. |
+| 20 | Cache | Form: `Category::activeForDropdown()`. After save: `clearDashboardCache()`. |
+| 21 | Response | `redirect()->route('tickets.show', $ticket)->with('success', $message)` — "Ticket TK-000041 was created successfully." or, for a replay, "This form was already submitted. Showing ticket TK-000041." |
+| 22 | Blade | Ticket details page with flash. |
+| 23 | Errors | Format errors → back with `@error` + `old()`; scope errors from `resolveScope()` on `project_id`/`client_id`; same token + different content → `TicketConflictException` (back with input / 409 JSON); 11th request per minute → 429; any exception → transaction rolled back **and** stored files deleted. |
+| 24 | Files | `TicketController.php`, `StoreTicketRequest.php`, `TicketService.php`, `AttachmentService.php`, `TicketNotifier.php`, `tickets/_scope-fields.blade.php`, tests `TicketScopeTest`, `ConsistencyTest`, `InternalNotesAndAttachmentsTest` |
+| 25 | Modifications | New priority (`PRIORITIES` **and** `SLA_HOURS`); admin alert in-app only (last `notifyAdmins()` argument `true` → `false`); allow agents to create client tickets (agent branch of `resolveScope()` + scope partial). |
 
-#### `TicketService::createTicket()` line by line
+`create()` prepares the form:
 
 ```php
-public function createTicket(array $data, User $creator): Ticket
+return view('tickets.create', [
+    'categories' => Category::activeForDropdown(),
+    // Admin chooses a client; customers' client is fixed; agents create internal tickets.
+    'clients' => $user->isAdmin() ? Client::active()->orderBy('name')->get(['id', 'code', 'name']) : collect(),
+    'projects' => $this->selectableProjects($user, null),
+    // Idempotency key: a new random UUID every time the form is opened.
+    'requestToken' => old('request_token', (string) Str::uuid()),
+]);
+```
+
+`store()` is short because the Form Request already authorized and validated:
+
+```php
+$ticket = $this->ticketService->createTicket(
+    $request->safe()->except('attachments'),
+    $request->user(),
+    $request->file('attachments', [])
+);
+
+$message = $ticket->wasRecentlyCreated
+    ? "Ticket {$ticket->ticket_number} was created successfully."
+    : "This form was already submitted. Showing ticket {$ticket->ticket_number}.";
+```
+
+`wasRecentlyCreated` is an Eloquent property: `true` only on the model instance that performed the INSERT. A
+replay returns a ticket loaded from the database → `false`.
+
+#### `TicketService::createTicket()` block by block
+
+```php
+public function createTicket(array $data, User $creator, array $files = []): Ticket
 {
-    $ticket = DB::transaction(function () use ($data, $creator) {
-        $createdAt = now();
+    $requestToken = $data['request_token'];
 
-        $ticket = new Ticket();
-        $ticket->fill($data);
-        $ticket->created_by = $creator->id;           // From the logged-in user, never from the form.
-        $ticket->assigned_to = null;
-        $ticket->status = Ticket::STATUS_OPEN;
-        $ticket->created_at = $createdAt;
-        $ticket->due_at = Ticket::calculateDueAt($createdAt, $ticket->priority);
-        $ticket->save();                               // INSERT -> the database generates the id.
+    // Replay of a request that already succeeded (double click, browser retry)?
+    $existingTicket = $this->findByRequestToken($creator, $requestToken);
+    if ($existingTicket !== null) {
+        return $this->replayOrReject($existingTicket, $data);
+    }
 
-        // Ticket number is built from the database id, so it is always unique
-        // (unlike MAX(id) + 1, which two requests could calculate at the same time).
-        $ticket->ticket_number = Ticket::makeTicketNumber($ticket->id);
-        $ticket->save();                               // UPDATE
+    // Files are written BEFORE the transaction; on any failure they are deleted again.
+    $storedFiles = $this->attachmentService->storeFiles($files);
+```
 
-        $this->recordActivity($ticket, $creator, 'created', null, 'Open');
+- Idempotency step 1: a cheap lookup for the common "double click after success" case.
+- Files first: a database rollback cannot delete a file, so the code writes files before and deletes them in the
+  `catch` blocks.
 
-        // Tell every active administrator that a new ticket is waiting (in-app + email).
-        // notifyUser() skips an admin who created the ticket themselves.
-        $admins = User::where('role', User::ROLE_ADMIN)->where('is_active', true)->get();
-        foreach ($admins as $admin) {
-            $this->notifyUser($admin, $ticket, $creator, 'created',
+```php
+    try {
+        $ticket = DB::transaction(function () use ($data, $creator, $requestToken, $storedFiles) {
+            [$projectId, $clientId] = $this->resolveScope($creator, $data['project_id'] ?? null, $data['client_id'] ?? null);
+            $createdAt = now();
+
+            $ticket = new Ticket;
+            $ticket->fill($data);                          // subject, description, category_id, priority
+            $ticket->project_id = $projectId;              // validated scope, never raw input
+            $ticket->client_id = $clientId;
+            $ticket->created_by = $creator->id;            // From the logged-in user, never from the form.
+            $ticket->assigned_to = null;
+            $ticket->status = Ticket::STATUS_OPEN;
+            $ticket->version = 1;
+            $ticket->request_token = $requestToken;
+            $ticket->created_at = $createdAt;
+            $ticket->due_at = Ticket::calculateDueAt($createdAt, $ticket->priority);
+            $ticket->save();                               // INSERT -> the database generates the id.
+
+            // Ticket number from the database id: always unique (unlike MAX(id) + 1).
+            $ticket->ticket_number = Ticket::makeTicketNumber($ticket->id);
+            $ticket->save();
+
+            TicketActivity::record($ticket, $creator, 'created', null, 'Open');
+
+            if (count($storedFiles) > 0) {
+                $this->attachmentService->createRecords($storedFiles, $ticket, null, $creator);
+                TicketActivity::record($ticket, $creator, 'attachment_added', null, $this->fileList($storedFiles));
+            }
+
+            // Tell every active administrator (except an admin who created it) - in-app + email.
+            $this->notifier->notifyAdmins($ticket, $creator, 'created',
                 'New ticket created',
                 "{$creator->name} created ticket {$ticket->ticket_number} \"{$ticket->subject}\".",
                 true);
+
+            return $ticket;
+        }, 3);
+```
+
+| Line(s) | Explanation |
+|---|---|
+| `[$projectId, $clientId] = $this->resolveScope(...)` | Array destructuring. `resolveScope()` returns the **trusted** scope (customer: own client; agent: no client; project checks with a shared lock). See [22 — section 6](22-V2-BUSINESS-FEATURES.md#6-role-specific-creation-rules-resolvescope). |
+| `$ticket->fill($data)` | Only `$fillable` keys are copied; `project_id`, `client_id`, `request_token` from `$data` are ignored by `fill()` and set explicitly. |
+| `version = 1` | Start of the optimistic-locking counter. |
+| `DB::transaction(..., 3)` | `BEGIN ... COMMIT`; the `3` retries the closure up to 3 times on a deadlock. |
+| first / second `save()` | INSERT (id generated) / UPDATE of `ticket_number`. |
+| `TicketActivity::record(...)` | V2 static helper on the model (replaced `TicketService::recordActivity()`). |
+| `notifyAdmins(..., true)` | One notification per active admin; `true` = also queue an email after commit. |
+
+```php
+    } catch (UniqueConstraintViolationException $exception) {
+        // A parallel request with the SAME token committed first.
+        $this->attachmentService->deleteFiles($storedFiles);
+        $existingTicket = $this->findByRequestToken($creator, $requestToken);
+        if ($existingTicket === null) {
+            throw $exception; // some other unique index failed
         }
 
-        return $ticket;
-    });
+        return $this->replayOrReject($existingTicket, $data);
+    } catch (Throwable $exception) {
+        $this->attachmentService->deleteFiles($storedFiles); // no orphaned files
+        throw $exception;
+    }
 
     $this->clearDashboardCache();
 
@@ -762,55 +883,46 @@ public function createTicket(array $data, User $creator): Ticket
 }
 ```
 
-| Line(s) | Explanation |
-|---|---|
-| `array $data, User $creator): Ticket` | Typed parameters and return type. `$data` is the validated array. |
-| `DB::transaction(function () use ($data, $creator) {...})` | Runs the closure inside `BEGIN ... COMMIT`. If any line throws, Laravel runs `ROLLBACK` and re-throws. The closure's `return` value becomes the return value of `DB::transaction()`. |
-| `$createdAt = now();` | One Carbon timestamp used for **both** `created_at` and the SLA calculation, so they match exactly. |
-| `$ticket->fill($data);` | Copies only `$fillable` keys: `subject`, `description`, `category_id`, `priority`. |
-| `created_by = $creator->id` | Never from the form — a user cannot create tickets in someone else's name. |
-| `status = Ticket::STATUS_OPEN` | Every ticket starts Open. |
-| `Ticket::calculateDueAt(...)` | Static helper: `$createdAt->copy()->addHours(self::SLA_HOURS[$priority])`. `copy()` prevents changing `$createdAt` itself (Carbon objects are mutable). |
-| first `save()` | `INSERT`. After it, `$ticket->id` holds the auto-increment id. |
-| `Ticket::makeTicketNumber($ticket->id)` | `'TK-' . str_pad((string) $id, 6, '0', STR_PAD_LEFT)` → `7` becomes `TK-000007`. |
-| second `save()` | `UPDATE` of the dirty column only. |
-| `recordActivity(..., 'created', null, 'Open')` | First timeline entry. |
-| `User::where('role', User::ROLE_ADMIN)->where('is_active', true)->get()` | Loads every active administrator. |
-| `foreach ... notifyUser($admin, ..., 'created', ..., true)` | One in-app notification per admin; `true` = also queue an email (pushed only after COMMIT). `notifyUser()` skips an admin who is the creator (`$recipient->id === $actor->id`). |
-| `clearDashboardCache()` | **After** the transaction, so the cache is only cleared when the data is really committed. |
+- Idempotency step 2: two requests with the same token can both pass the first lookup. The UNIQUE index
+  `(created_by, request_token)` lets only one INSERT succeed; the loser lands in the first `catch` and returns the
+  winner's ticket.
+- `replayOrReject()`: same subject/description/category/priority → return the existing ticket; different content
+  → `TicketConflictException`.
 
-Equivalent SQL:
+Equivalent SQL (customer John, id 6, client 1, project 1):
 
 ```sql
+SELECT * FROM tickets WHERE created_by = 6 AND request_token = '6f1c...' LIMIT 1;
 START TRANSACTION;
-INSERT INTO tickets (subject, description, category_id, priority, created_by, assigned_to, status,
-                     created_at, due_at, updated_at)
-VALUES ('Cannot export invoices', '...', 3, 'high', 12, NULL, 'open',
-        '2026-11-25 10:00:00', '2026-11-25 18:00:00', '2026-11-25 10:00:00');
--- suppose the new id is 33
-UPDATE tickets SET ticket_number = 'TK-000033', updated_at = NOW() WHERE id = 33;
-INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, created_at, updated_at)
-VALUES (33, 12, 'created', NULL, 'Open', NOW(), NOW());
+SELECT EXISTS(SELECT * FROM clients WHERE id = 1 AND is_active = 1) AS `exists`;
+SELECT * FROM projects WHERE id = 1 LIMIT 1 LOCK IN SHARE MODE;
+SELECT EXISTS(SELECT * FROM clients INNER JOIN client_project ON clients.id = client_project.client_id
+              WHERE client_project.project_id = 1 AND clients.id = 1) AS `exists`;
+INSERT INTO tickets (subject, description, category_id, priority, project_id, client_id, created_by, assigned_to,
+                     status, version, request_token, created_at, due_at, updated_at)
+VALUES ('Leave balance shows negative days', '...', 2, 'high', 1, 1, 6, NULL, 'open', 1, '6f1c...',
+        '2026-11-26 10:00:00', '2026-11-26 18:00:00', '2026-11-26 10:00:00');
+UPDATE tickets SET ticket_number = 'TK-000041' WHERE id = 41;
+INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, is_internal, ...)
+VALUES (41, 6, 'created', NULL, 'Open', 0, ...);
 SELECT * FROM users WHERE role = 'admin' AND is_active = 1;
--- one per active admin (here admin id 1):
 INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, read_at, created_at, updated_at)
-VALUES ('<uuid>', 'App\\Notifications\\TicketNotification', 'App\\Models\\User', 1,
-        '{"ticket_id":33,"ticket_number":"TK-000033","title":"New ticket created",...,"event_type":"created"}', NULL, NOW(), NOW());
+VALUES ('<uuid>', 'App\\Notifications\\TicketNotification', 'App\\Models\\User', 1, '{"ticket_id":41,...}', NULL, NOW(), NOW());
 COMMIT;
-INSERT INTO jobs (queue, payload, attempts, reserved_at, available_at, created_at) VALUES ('default', '{...}', 0, NULL, ..., ...);  -- afterCommit, per admin
-DELETE FROM cache WHERE `key` = 'resolvedesk-cache-dashboard:admin:stats';
+-- after COMMIT: broadcast notification.created; INSERT INTO jobs (...); DELETE FROM cache WHERE key = '...dashboard:admin:stats'
 ```
 
 **Why `ticket_number` is nullable:** between the INSERT and the UPDATE the number does not exist yet. Both happen
 inside one transaction, so no other request ever sees a ticket without a number.
 
 **Why `due_at` is DATETIME:** on MariaDB/older MySQL the first non-null `TIMESTAMP` column silently gets
-`ON UPDATE CURRENT_TIMESTAMP`, which overwrote the SLA deadline on every update. Found during seeding; see
-`DEVELOPMENT_PROGRESS.md`.
+`ON UPDATE CURRENT_TIMESTAMP`, which overwrote the SLA deadline on every update (see the database guide §4.6).
 
-> **বাংলায়:** Transaction মানে কয়েকটি database কাজকে একটি প্যাকেটে বাঁধা — হয় সবগুলো সফল হবে (COMMIT), নয়তো
-> একটিও থাকবে না (ROLLBACK)। এখানে টিকিট INSERT, ticket number UPDATE আর activity INSERT একসাথে হয়; মাঝপথে error
-> হলে অর্ধেক তৈরি টিকিট database-এ থেকে যায় না।
+Full 30-question walkthrough of this operation: [22 — 15.1](22-V2-BUSINESS-FEATURES.md#151-create-a-project-ticket-as-a-customer).
+
+> **বাংলায়:** Transaction মানে কয়েকটি database কাজকে একটি প্যাকেটে বাঁধা — হয় সব সফল (COMMIT), নয়তো একটিও না
+> (ROLLBACK)। V2-তে আরও দুটো জিনিস: `request_token` (একই form দুইবার জমা দিলেও একটাই টিকিট) আর file আগে লেখা,
+> ব্যর্থ হলে মুছে ফেলা — কারণ transaction file-কে rollback করতে পারে না।
 
 ### 4.2 Operation: List, search and filter tickets
 
@@ -819,114 +931,81 @@ inside one transaction, so no other request ever sees a ticket without a number.
 | 1 | Business purpose | Find tickets fast; each role sees only what it may see. |
 | 2 | User roles | Admin (all tickets, "All Tickets"); agent and customer (created by or assigned to them, "My Tickets"). |
 | 3 | UI page | Tickets list. |
-| 4 | UI actions | Search, Status, Priority, Category, Assigned agent (admin only, incl. "Unassigned"), Created from/to, Overdue only, **Filter**, **Reset**, View, Edit (if allowed), pagination. Dashboard tiles also link here (e.g. `?status=open`, `?overdue=1`). |
+| 4 | UI actions | Search, Status, Priority, Category, V2 Project (incl. "Global"), V2 Client (admin, incl. "Internal"), Assigned agent (admin, incl. "Unassigned"), Created from/to, Overdue only, **Filter**, **Reset**, View, Edit (if allowed), pagination. Dashboard tiles and the project/client "All tickets" buttons link here. |
 | 5 | Blade | `tickets/index.blade.php`, `partials/ticket-badges.blade.php` |
 | 6 | On click | GET form → filters go into the URL. |
-| 7 | Form data | `search`, `status`, `priority`, `category_id`, `assigned_to`, `date_from`, `date_to`, `overdue`, `page`. |
-| 8 | Method + URL | `GET /tickets?search=TK-00002&status=in_progress&overdue=1` |
+| 7 | Form data | `search`, `status`, `priority`, `category_id`, `project_id`, `client_id`, `assigned_to`, `date_from`, `date_to`, `overdue`, `page`. |
+| 8 | Method + URL | `GET /tickets?project_id=global&status=in_progress&overdue=1` |
 | 9 | Route | `tickets.index` |
 | 10 | Middleware | `auth`, `active` |
-| 11 | Controller | `TicketController::index(Request $request)` |
-| 12 | Validation | `search` nullable max 100 · `status` `Rule::in(array_keys(Ticket::STATUSES))` · `priority` `Rule::in(...)` · `category_id` nullable integer · `date_from` nullable date · `date_to` nullable date `after_or_equal:date_from`. (`assigned_to` has no rule; it is only used for admins and always passed as a bound parameter.) |
-| 13 | Authorization | Row-level filter with the `visibleTo($user)` scope; Edit button with `@can('update', $ticket)`. |
-| 14 | Business logic | Add a `where` only for filled filters; `overdue` uses the `overdue()` scope. |
-| 15 | Eloquent | `Ticket::with(['category', 'creator', 'assignedAgent'])->visibleTo($user)->...->latest()->paginate(self::PER_PAGE)->withQueryString()` |
+| 11 | Controller | `TicketController::index(Request $request)` → `TicketController::applyFilters($query, $request, $user)` (V2, `public static`, shared with `ReportController`) |
+| 12 | Validation | `search` max 100 · `status` / `priority` in the constants · `category_id` integer · V2 `project_id` regex `^(global|\d+)$` · V2 `client_id` regex `^(internal|\d+)$` · V2 `assigned_to` regex `^(unassigned|\d+)$` (now validated) · dates, `date_to` `after_or_equal:date_from`. |
+| 13 | Authorization | `visibleTo($user)` is applied **before** the filters; client/agent filters only for admins; Edit button `@can('update', $ticket)`. |
+| 14 | Business logic | Add a `where` only for filled filters. |
+| 15 | Eloquent | `Ticket::with(['category', 'project', 'client', 'creator', 'assignedAgent'])->visibleTo($user)`, `applyFilters()`, `latest()->paginate(self::PER_PAGE)->withQueryString()` |
 | 16 | SQL | see below |
 | 17–19 | DB / Notification / Queue | — |
-| 20 | Cache | Not cached (filters change constantly). The category filter uses a fresh query (`Category::orderBy('name')->get(['id', 'name'])`) so inactive categories are listed too, for old tickets. |
-| 21 | Response | `view('tickets.index', ['tickets' => ..., 'categories' => ..., 'agents' => ...])` |
-| 22 | Blade | `@forelse ($tickets as $ticket)`; overdue rows get class `row-overdue`; `{{ $ticket->assignedAgent?->name ?? '—' }}`; `{{ $tickets->links() }}`. |
-| 23 | Errors | Invalid filter (e.g. `status=foo`, `date_to` before `date_from`) → redirect back with errors. |
-| 24 | Files | `TicketController.php`, `Ticket.php` (scopes), `tickets/index.blade.php`, `tests/Feature/TicketManagementTest.php` |
-| 25 | Modifications | Add a "created by" filter for admins; change `PER_PAGE`; sort by deadline: replace `latest()` with `orderBy('due_at')`. |
+| 20 | Cache | Not cached. Filter lists are read directly (categories incl. inactive; projects; admin: clients, active agents). |
+| 21 | Response | `view('tickets.index', ['tickets', 'categories', 'projects', 'clients', 'agents'])` |
+| 22 | Blade | `@forelse ($tickets as $ticket)`; overdue rows get `row-overdue`; project code or "Global"; `{{ $tickets->links() }}`. |
+| 23 | Errors | Invalid filter → redirect back with errors. |
+| 24 | Files | `TicketController.php`, `Ticket.php` (scopes), `tickets/index.blade.php`, tests `TicketManagementTest`, `TicketScopeTest::test_ticket_list_can_filter_global_and_project_tickets` |
+| 25 | Modifications | Add a "created by" filter for admins inside `applyFilters()` (then the report and CSV get it too); sort by deadline: `orderBy('due_at')` instead of `latest()`. |
 
-Key code:
+Key code (`applyFilters()`, V2 parts):
 
 ```php
-// with(): eager loading. Loads categories, creators and agents in 3 extra
-// queries in total instead of 3 queries PER ROW (avoids the N+1 problem).
-$query = Ticket::with(['category', 'creator', 'assignedAgent'])
-    ->visibleTo($user);
-
-if ($request->filled('search')) {
-    $search = $request->input('search');
-    $query->where(function ($subQuery) use ($search) {
-        $subQuery->where('ticket_number', 'like', "%{$search}%")
-            ->orWhere('subject', 'like', "%{$search}%");
-    });
-}
-...
-// Assigned agent filter is only offered to admins.
-if ($user->isAdmin() && $request->filled('assigned_to')) {
-    if ($request->input('assigned_to') === 'unassigned') {
-        $query->whereNull('assigned_to');
+if ($request->filled('project_id')) {
+    if ($request->input('project_id') === 'global') {
+        $query->whereNull('project_id');
     } else {
-        $query->where('assigned_to', $request->input('assigned_to'));
+        $query->where('project_id', (int) $request->input('project_id'));
     }
 }
-...
-if ($request->boolean('overdue')) {
-    $query->overdue();
-}
 
-// withQueryString(): keeps the filters in the pagination links.
-$tickets = $query->latest()->paginate(self::PER_PAGE)->withQueryString();
+// Client and agent filters are admin-only (others already see only their own tickets).
+if ($user->isAdmin() && $request->filled('client_id')) {
+    if ($request->input('client_id') === 'internal') {
+        $query->whereNull('client_id');
+    } else {
+        $query->where('client_id', (int) $request->input('client_id'));
+    }
+}
 ```
 
-- `$query` is a **query builder**: nothing runs until `paginate()`. Each `if` adds one condition.
-- `latest()` = `ORDER BY created_at DESC`.
-- `paginate(15)` runs **two** queries: a `COUNT(*)` for the total and the page query with `LIMIT/OFFSET`.
+- `$query` is a **query builder** passed by reference semantics (objects are handles in PHP), so
+  `applyFilters()` can add conditions without returning anything (`: void`).
+- `whereNull()` → `IS NULL` (never `= NULL`).
 
-Equivalent SQL for a customer (id 12) searching "printer", status in_progress, overdue only:
+Equivalent SQL for a customer (id 6) with `project_id=global&status=in_progress&overdue=1`:
 
 ```sql
 SELECT COUNT(*) AS aggregate FROM tickets
-WHERE (created_by = 12 OR assigned_to = 12)
-  AND (ticket_number LIKE '%printer%' OR subject LIKE '%printer%')
-  AND status = 'in_progress'
+WHERE (created_by = 6 OR assigned_to = 6)
+  AND status = 'in_progress' AND project_id IS NULL
   AND status IN ('open', 'assigned', 'in_progress') AND due_at < NOW();
 
-SELECT * FROM tickets
-WHERE (created_by = 12 OR assigned_to = 12)
-  AND (ticket_number LIKE '%printer%' OR subject LIKE '%printer%')
-  AND status = 'in_progress'
-  AND status IN ('open', 'assigned', 'in_progress') AND due_at < NOW()
-ORDER BY created_at DESC LIMIT 15 OFFSET 0;
-
+SELECT * FROM tickets WHERE (...same...) ORDER BY created_at DESC LIMIT 15 OFFSET 0;
 -- eager loading: one query per relationship for the whole page
-SELECT * FROM categories WHERE id IN (1, 3, 4);
-SELECT * FROM users WHERE id IN (12);          -- creator
+SELECT * FROM categories WHERE id IN (...);
+SELECT * FROM projects WHERE id IN (...);
+SELECT * FROM clients WHERE id IN (...);
+SELECT * FROM users WHERE id IN (6);           -- creator
 SELECT * FROM users WHERE id IN (2, 5);        -- assignedAgent
 ```
 
-Admin-only `agentList()` (dropdowns with workload):
-
-```php
-return User::where('role', User::ROLE_AGENT)
-    ->where('is_active', true)
-    ->withCount(['assignedTickets as workload_count' => function ($query) {
-        $query->whereIn('status', Ticket::WORKLOAD_STATUSES);
-    }])
-    ->orderBy('name')
-    ->get();
-```
-
-`'assignedTickets as workload_count'` renames the count attribute from the default `assigned_tickets_count` to
-`workload_count`. The closure adds conditions to the counting sub-query.
-
-> **বাংলায়:** Eager loading (`with()`) না করলে ১৫টি টিকিটের জন্য category, creator, agent আনতে ৪৫টি অতিরিক্ত query
-> চলত — এটাই N+1 সমস্যা। `with()` দিলে প্রতিটি relationship-এর জন্য মাত্র একটি `WHERE id IN (...)` query চলে।
-> আর `visibleTo()` scope নিশ্চিত করে যে admin ছাড়া অন্য কেউ শুধু নিজের তৈরি বা নিজের কাছে assign করা টিকিট দেখবে।
+> **বাংলায়:** `visibleTo()` আগে বসে, filter পরে — তাই filter যতই বদলানো হোক, কেউ নিজের অনুমতির বাইরের টিকিট দেখতে
+> পায় না। `applyFilters()` static method, একই কোড report page আর CSV export-ও ব্যবহার করে।
 
 ### 4.3 Operation: Show ticket details
 
 | # | Item | Detail |
 |---|---|---|
 | 1 | Business purpose | One page with everything about a ticket and its allowed actions. |
-| 2 | User roles | Admin; creator; assigned agent. |
+| 2 | User roles | Admin; creator; assigned agent. (Project membership alone does **not** give access.) |
 | 3 | UI page | Ticket details. |
-| 4 | UI actions | Edit Ticket, Assign/Reassign, Auto Assign, Start Working, Resolve, Confirm & Close, Reopen, Post Comment (each only if allowed). |
-| 5 | Blade | `tickets/show.blade.php`, `partials/ticket-badges.blade.php` |
+| 4 | UI actions | Edit Ticket, Assign/Reassign, Auto Assign, Start Working, Resolve, Confirm & Close, Reopen, Post (reply / internal note), download attachments (each only if allowed). |
+| 5 | Blade | `tickets/show.blade.php`, `tickets/_attachments.blade.php`, `tickets/_attachment-input.blade.php`, `partials/ticket-badges.blade.php` |
 | 6 | On click | Link from list, dashboard, notification or email. |
 | 7 | Form data | — |
 | 8 | Method + URL | `GET /tickets/{ticket}` |
@@ -934,209 +1013,203 @@ return User::where('role', User::ROLE_AGENT)
 | 10 | Middleware | `auth`, `active` |
 | 11 | Controller | `TicketController::show(Request $request, Ticket $ticket)` |
 | 12 | Validation | — |
-| 13 | Authorization | `Gate::authorize('view', $ticket)` → `TicketPolicy::view()`; buttons with `@can(...)`. |
-| 14 | Business logic | Eager-load everything; admins also get the agent list with workloads. |
-| 15 | Eloquent | `$ticket->load(['category', 'creator', 'assignedAgent', 'comments.user', 'activities.user'])` |
-| 16 | SQL | `SELECT * FROM tickets WHERE id = 7 LIMIT 1;` (binding) · `SELECT * FROM categories WHERE id IN (3);` · `SELECT * FROM users WHERE id IN (12);` · `SELECT * FROM users WHERE id IN (5);` · `SELECT * FROM ticket_comments WHERE ticket_id IN (7) ORDER BY created_at, id;` · `SELECT * FROM users WHERE id IN (...);` (comment authors) · `SELECT * FROM ticket_activities WHERE ticket_id IN (7) ORDER BY created_at, id;` · `SELECT * FROM users WHERE id IN (...);` (activity users) |
+| 13 | Authorization | `Gate::authorize('view', $ticket)`; buttons with `@can(...)`; internal content filtered in SQL. |
+| 14 | Business logic | Eager-load everything the page shows; customers never receive internal notes/activities; admins get eligible agents. |
+| 15 | Eloquent | `$ticket->load([...])` with constrained eager loads (below); `TicketAssignmentService::eligibleAgents($ticket)` |
+| 16 | SQL | see the database guide §10.7 (comments with `AND visibility = 'public'` and activities with `AND is_internal = 0` for customers). |
 | 17–20 | — | — |
 | 21 | Response | `view('tickets.show', ['ticket' => $ticket, 'agents' => ...])` |
-| 22 | Blade | Description, resolution note, conversation, activity timeline, Actions card, details card (SLA deadline, overdue badge with `diffForHumans`). |
-| 23 | Errors | Not allowed → 403 page; unknown id → 404. |
-| 24 | Files | `TicketController.php`, `TicketPolicy.php`, `tickets/show.blade.php` |
+| 22 | Blade | Header "TK-000041 · HRMS · ACME"; description + ticket files; resolution note; conversation (internal notes with a yellow badge); timeline ("System" for `user_id` NULL, "internal" badge); Actions card (hidden `version` in every form); details card (project, client, SLA remaining / overdue / within or after SLA, version). |
+| 23 | Errors | Not allowed → 403; unknown id → 404. |
+| 24 | Files | `TicketController.php`, `TicketPolicy.php`, `TicketAssignmentService.php`, `tickets/show.blade.php` |
 | 25 | Modifications | Show the SLA hours next to the priority: `{{ \App\Models\Ticket::SLA_HOURS[$ticket->priority] }}`. |
 
-`'comments.user'` is **nested eager loading**: load the comments, then the user of every comment.
-The relationships `comments()` and `activities()` already contain `->orderBy('created_at')->orderBy('id')`, so
-the lists are chronological (the `id` tie-breaker keeps rows created in the same second in insert order).
-
-`TicketPolicy::view()`:
-
 ```php
-public function view(User $user, Ticket $ticket): bool
-{
-    if ($user->isAdmin()) {
-        return true;
-    }
-
-    return $this->isCreator($user, $ticket) || $this->isAssignedAgent($user, $ticket);
-}
+// Eager load what the page displays. Customers never receive internal notes
+// or internal activities: they are filtered out in the SQL query itself.
+$ticket->load([
+    'category', 'project', 'client', 'creator', 'assignedAgent',
+    'comments' => fn ($query) => $query->visibleTo($user)->with(['user', 'attachments']),
+    'activities' => fn ($query) => $query->visibleTo($user)->with('user'),
+    'attachments' => fn ($query) => $query->whereNull('ticket_comment_id'),
+]);
 ```
 
-The Actions card is only shown if at least one action is allowed:
+- `'relation' => fn ($query) => ...` is a **constrained eager load**: the closure adds conditions to the eager
+  query. `->with([...])` inside it is nested eager loading (comment authors, comment files).
+- `visibleTo($user)` is a local scope on `TicketComment` / `TicketActivity`: no condition for staff,
+  `visibility = 'public'` / `is_internal = 0` for customers.
+- Ticket-level files are those with `ticket_comment_id IS NULL`; comment files come through `comments.attachments`.
 
-```blade
-@php($hasActions = auth()->user()->can('assign', $ticket) || auth()->user()->can('start', $ticket) || auth()->user()->can('resolve', $ticket) || auth()->user()->can('reopen', $ticket) || auth()->user()->can('close', $ticket))
-```
+`TicketPolicy::view()` is unchanged from V1 (admin, creator or assigned agent).
 
 ### 4.4 Operation: Edit a ticket
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Correct subject, description, category or priority. **Status is never edited here.** |
+| 1 | Business purpose | Correct subject, description, category or priority. **Status and scope (project/client) are never edited here.** |
 | 2 | User roles | Admin: any non-closed ticket. Creator: only while **Open and unassigned**. |
 | 3 | UI page | Edit Ticket. |
 | 4 | UI actions | **Save Changes**, Cancel. |
-| 5 | Blade | `tickets/edit.blade.php` (`@method('PUT')`) + `tickets/_form.blade.php` |
+| 5 | Blade | `tickets/edit.blade.php` (`@method('PUT')`, hidden `version`, scope shown read-only) + `tickets/_form.blade.php` |
 | 6 | On click | POST with `_method=PUT`. |
-| 7 | Form data | `subject`, `description`, `category_id`, `priority`. |
+| 7 | Form data | `subject`, `description`, `category_id`, `priority`, V2 `version`. |
 | 8 | Method + URL | `GET /tickets/{ticket}/edit` · `PUT /tickets/{ticket}` |
 | 9 | Route | `tickets.edit`, `tickets.update` |
 | 10 | Middleware | `auth`, `active` |
 | 11 | Controller | `TicketController::edit(Ticket $ticket)`, `TicketController::update(Request $request, Ticket $ticket)` |
-| 12 | Validation | Same as create, but `category_id` uses `'exists:categories,id'` (the current category may be **inactive**). A **new** category must be active (manual check below). |
+| 12 | Validation | `category_id` `exists:categories,id` (current may be inactive) + a **new** category must be active; V2 `'version' => ['required', 'integer']`. |
 | 13 | Authorization | `Gate::authorize('update', $ticket)` → `TicketPolicy::update()` |
-| 14 | Business logic | `TicketService::updateTicket()`: detect changes with `isDirty()`; priority change → recalculate `due_at` from the original `created_at`; write activities. |
-| 15 | Eloquent | `fill()`, `isDirty()`, `getOriginal()`, `save()`, `TicketActivity::create()` |
-| 16 | SQL | `UPDATE tickets SET priority = 'critical', due_at = '2026-11-25 12:00:00', updated_at = NOW() WHERE id = 7;` + up to 3 `INSERT INTO ticket_activities ...` |
-| 17 | DB changes | Ticket row + activities `updated`, `priority_changed`, `due_date_changed`. |
+| 14 | Business logic | `TicketService::updateTicket($ticket, $validated, $expectedVersion, $user)`: detect changes; priority change → recalculate `due_at` from the original `created_at` and reset `sla_notified_at`; one conditional UPDATE with the version check; activities. |
+| 15 | Eloquent | `fill()`, `isDirty()`, `getOriginal()`, `getDirty()`, `Ticket::whereKey()->where('version', ...)->where('status', '!=', 'closed')->update(...)`, `syncOriginal()`, `TicketActivity::record()` |
+| 16 | SQL | `UPDATE tickets SET priority = 'critical', due_at = '2026-11-26 12:00:00', sla_notified_at = NULL, version = version + 1, updated_at = NOW() WHERE id = 41 AND version = 3 AND status != 'closed';` + up to 3 activity INSERTs |
+| 17 | DB changes | Ticket row (+ version) + activities `updated`, `priority_changed`, `due_date_changed`. |
 | 18–19 | Notification / Queue | None. |
-| 20 | Cache | `clearDashboardCache()` (priority counts may change). The edit form reads the category cache. |
-| 21 | Response | `redirect()->route('tickets.show', $ticket)->with('success', $message)` — `'Ticket updated successfully.'` or `'No changes were made.'` |
-| 22 | Blade | Details page; timeline shows "changed the priority  High → Critical" and "sla deadline recalculated". |
-| 23 | Errors | Inactive new category → `ValidationException` on `category_id`. Not allowed → 403. |
-| 24 | Files | `TicketController.php`, `TicketService.php`, `TicketPolicy.php`, `tickets/edit.blade.php` |
+| 20 | Cache | `clearDashboardCache()` after a real change. |
+| 21 | Response | `redirect()->route('tickets.show', $ticket)->with('success', $message)` — "Ticket updated successfully." or "No changes were made." |
+| 22 | Blade | Details page; timeline shows the changes; version increased. |
+| 23 | Errors | Inactive new category → `category_id` error. Stale version (someone else changed the ticket, or it was closed meanwhile) → `TicketConflictException`: back with input + "This ticket was changed by someone else after you opened the page. Please review the latest version and try again." Not allowed → 403. |
+| 24 | Files | `TicketController.php`, `TicketService.php`, `Ticket.php` (`ensureVersion`), `TicketConflictException.php`, `tickets/edit.blade.php`, `tests/Feature/ConsistencyTest.php` |
 | 25 | Modifications | Allow agents to change priority: change `TicketPolicy::update()`. |
 
-Keeping an inactive current category selectable (`edit()`):
+`TicketService::updateTicket()` — the V2 optimistic-locking core:
 
 ```php
-$categories = Category::activeForDropdown();
+DB::transaction(function () use ($ticket, $expectedVersion, $editor, $changedFields, $priorityChanged, $oldPriority, $oldDueAt) {
+    $changes = $ticket->getDirty();
+    $changes['version'] = DB::raw('version + 1');
+    $changes['updated_at'] = now();
 
-// Keep the ticket's current category selectable even if it was deactivated,
-// so editing does not force a category change.
-if (! $categories->contains('id', $ticket->category_id)) {
-    // concat() returns a NEW collection, so the cached list itself is not modified.
-    $categories = $categories->concat([$ticket->category])->sortBy('name');
-}
+    $updatedRows = Ticket::whereKey($ticket->id)
+        ->where('version', $expectedVersion)
+        ->where('status', '!=', Ticket::STATUS_CLOSED)
+        ->update($changes);
+
+    if ($updatedRows === 0) {
+        throw TicketConflictException::staleVersion();
+    }
+
+    $ticket->version = $expectedVersion + 1;
+    $ticket->syncOriginal(); // the model now matches the database row
+    ...
+}, 3);
 ```
 
-New category must be active (`update()`):
+- `getDirty()` returns only the changed attributes, e.g. `['priority' => 'critical', 'due_at' => ..., 'sla_notified_at' => null]`.
+- `DB::raw('version + 1')` lets the database increment the value atomically.
+- The `WHERE version = ?` makes check-and-write **one** statement: no lock is held while the user edits, and
+  a concurrent change makes the UPDATE affect 0 rows → conflict instead of a lost update.
+- `syncOriginal()` marks the model as clean so later `isDirty()` calls are correct.
+- Example: created 10:00, High (8 h) → due 18:00. Changed to Critical (2 h) → due **12:00** (from 10:00, not "now").
 
-```php
-$newCategoryId = (int) $validated['category_id'];
-if ($newCategoryId !== $ticket->category_id) {
-    $isActive = Category::where('id', $newCategoryId)->where('is_active', true)->exists();
-    if (! $isActive) {
-        throw ValidationException::withMessages(['category_id' => 'Please choose an active category.']);
-    }
-}
-```
-
-`(int)` is needed because form values are strings and `!==` is strict; `$ticket->category_id` is an `int` thanks
-to the `'integer'` cast.
-
-`TicketService::updateTicket()` — the important part:
-
-```php
-$ticket->fill($data);
-
-if (! $ticket->isDirty()) {
-    return false;
-}
-
-// Remember old values before saving, for the activity history.
-$oldPriority = $ticket->getOriginal('priority');
-$oldDueAt = $ticket->due_at;
-$priorityChanged = $ticket->isDirty('priority');
-...
-DB::transaction(function () use ($ticket, $editor, $changedFields, $priorityChanged, $oldPriority, $oldDueAt) {
-    if ($priorityChanged) {
-        // SLA is always recalculated from the ORIGINAL creation time.
-        $ticket->due_at = Ticket::calculateDueAt($ticket->created_at, $ticket->priority);
-    }
-
-    $ticket->save();
-
-    if (count($changedFields) > 0) {
-        $this->recordActivity($ticket, $editor, 'updated', null, 'Changed: ' . implode(', ', $changedFields));
-    }
-
-    if ($priorityChanged) {
-        $this->recordActivity($ticket, $editor, 'priority_changed', Ticket::PRIORITIES[$oldPriority], $ticket->priorityLabel());
-        $this->recordActivity($ticket, $editor, 'due_date_changed', $this->formatDate($oldDueAt), $this->formatDate($ticket->due_at));
-    }
-});
-```
-
-- `isDirty()` — "has any attribute changed since loading?". `isDirty('priority')` checks one column.
-- `getOriginal('priority')` — the value as loaded from the database.
-- Old values are captured **before** `save()`; after saving, "original" becomes the new value.
-- `implode(', ', $changedFields)` → `"Changed: Subject, Category"`.
-- Example: created 10:00, priority High (8 h) → due 18:00. Changed to Critical (2 h) → due **12:00** (counted from
-  10:00, not from "now").
-- Note: unlike the workflow actions, `updateTicket()` does not lock the row (see
-  [section 13](#13-known-issues-and-limitations-found-while-writing-this-document)).
+> **বাংলায়:** Optimistic locking: form-এ যে version দেখানো হয়েছিল সেটা ফেরত আসে। UPDATE-এর WHERE-এ সেই version
+> মেলানো হয়; এর মধ্যে অন্য কেউ বদলালে version মিলবে না, 0 row update হবে, আর ব্যবহারকারীকে "অন্য কেউ বদলেছে" বলা
+> হবে — চুপচাপ অন্যের পরিবর্তন মুছে যাবে না (lost update)।
 
 ---
 
 ## 5. Assignment: manual, automatic, reassignment
 
-Files: `TicketController::assign()` / `autoAssign()`, `TicketService::assignAgent()` / `autoAssign()` /
-`findLeastBusyAgent()` / `performAssignment()`, `TicketPolicy::assign()`, `tickets/show.blade.php` (Actions card).
+Files: `TicketController::assign()` / `autoAssign()`, **V2** `app/Services/TicketAssignmentService.php`
+(`assignAgent()`, `autoAssign()`, `findLeastBusyAgent()`, `eligibleAgents()`, private `performAssignment()`,
+`lockProjectAndTicket()`, `withAssignmentLock()`), `Ticket::canBeAssignedTo()`, `TicketPolicy::assign()`,
+`tickets/show.blade.php` (Actions card). In V1 these methods lived in `TicketService`.
 
 ### 5.1 Operation: Manual assign / reassign
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Admin gives the ticket to a specific agent, or moves it to another agent. |
+| 1 | Business purpose | Admin gives the ticket to a specific eligible agent, or moves it to another one. |
 | 2 | User roles | Admin. |
 | 3 | UI page | Ticket details → Actions card. |
-| 4 | UI actions | Choose an agent (shown as "Sarah Ahmed (2 active)") → **Assign** / **Reassign** (JS confirm). |
-| 5 | Blade | `tickets/show.blade.php` inside `@can('assign', $ticket)`. |
+| 4 | UI actions | Choose an agent (only eligible agents listed, "David Chen (1 active)") → **Assign** / **Reassign** (confirm). |
+| 5 | Blade | `tickets/show.blade.php` inside `@can('assign', $ticket)`; help text "Only active agents of HRMS are listed." / "Global ticket: every active agent is eligible." |
 | 6 | On click | Confirm → POST form. |
-| 7 | Form data | `agent_id`. |
+| 7 | Form data | `agent_id`, V2 `version`. |
 | 8 | Method + URL | `POST /tickets/{ticket}/assign` |
 | 9 | Route | `tickets.assign` |
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `TicketController::assign(Request $request, Ticket $ticket)` |
-| 12 | Validation | `'agent_id' => ['required', 'integer', 'exists:users,id']`, then `User::findOrFail(...)`; in the service: the user must still be an **active agent**. |
-| 13 | Authorization | `role:admin` + `Gate::authorize('assign', $ticket)` → admin **and** status in `ACTIVE_STATUSES` (Open / Assigned / In Progress). |
-| 14 | Business logic | Lock ticket → re-check status → re-read agent → same agent? return `false` → set `assigned_to`; Open → Assigned; reassign keeps status → activities → notify agent (+ email). |
-| 15 | Eloquent | `lockTicket()`, `User::find()`, `$ticket->save()`, `setRelation()`, `TicketActivity::create()`, `$agent->notify()` |
+| 12 | Validation | `agent_id` required integer `exists:users,id`; `version` nullable integer; service: `canBeAssignedTo()`. |
+| 13 | Authorization | `role:admin` + `Gate::authorize('assign', $ticket)` (admin and status Open/Assigned/In Progress). |
+| 14 | Business logic | Assignment cache lock → transaction → project shared lock + ticket `FOR UPDATE` → `ensureVersion()` → status re-check → agent re-read + eligibility → same agent? `false` → update (Open → Assigned; reassignment keeps the status), `version + 1` → activities → notify new agent (+ email) and, on reassignment, the previous agent (in-app). |
+| 15 | Eloquent | `Cache::lock()->block()`, `Project::whereKey()->sharedLock()->first()`, `Ticket::whereKey()->lockForUpdate()->firstOrFail()`, `User::find()`, `DB::table('project_user')->exists()`, `save()`, `TicketActivity::record()`, `notify()` |
 | 16 | SQL | see below |
-| 17 | DB changes | `tickets.assigned_to`, maybe `tickets.status`; activity rows; 1 `notifications` row; after commit 1 `jobs` row. |
-| 18 | Notification | To the new agent: "New ticket assigned" or "Ticket reassigned to you". |
-| 19 | Queue | `SendTicketEmail` to the new agent (after commit). |
-| 20 | Cache | `clearDashboardCache()` only if something changed. |
-| 21 | Response | Changed: `back()->with('success', "Ticket assigned to {$agent->name}.")`. Same agent: `back()->with('info', "The ticket is already assigned to {$agent->name}. Nothing was changed.")` |
-| 22 | Blade / JS | Details page: agent name, status badge, timeline, flash. The agent's bell updates within ~5 s (polling). |
-| 23 | Errors | Inactive agent / customer chosen → "Please select an active support agent."; Resolved/Closed ticket → 403 from the policy (or the service's "Only Open, Assigned or In Progress tickets can be assigned." if the status changed in between). |
-| 24 | Files | `TicketController.php`, `TicketService.php`, `TicketPolicy.php`, `tests/Feature/TicketWorkflowTest.php` |
-| 25 | Modifications | Also notify the **previous** agent on reassignment: add a `notifyUser($previousAgent, ...)` call in the `else` branch. |
+| 17 | DB changes | `tickets.assigned_to`, maybe `status`, `version`; activity rows; 1–2 `notifications`; after commit 1 `jobs` row; temporary `cache_locks` row. |
+| 18 | Notification | New agent: "New ticket assigned" / "Ticket reassigned to you". V2: previous agent: "Ticket reassigned to another agent" — "Ticket TK-000041 is no longer assigned to you." (no subject: they lose access). |
+| 19 | Queue | `SendTicketEmail` to the new agent only, after commit and after the lock is released. |
+| 20 | Cache | Assignment lock in the cache store; `Cache::forget(TicketService::DASHBOARD_CACHE_KEY)` only if something changed. |
+| 21 | Response | `back()->with('success', "Ticket assigned to {$agent->name}.")` / `back()->with('info', "The ticket is already assigned to {$agent->name}. Nothing was changed.")` |
+| 22 | Blade / JS | Agent name, status, version, timeline, flash. The agent's bell updates via WebSocket or polling. |
+| 23 | Errors | Ineligible agent → "Please select an active support agent [who supports this ticket's project]."; Resolved/Closed → 403 or "Only Open, Assigned or In Progress tickets can be assigned."; stale version → conflict; lock wait > 5 s → "Another assignment is being processed right now. Please try again in a moment." |
+| 24 | Files | `TicketController.php`, `TicketAssignmentService.php`, `TicketNotifier.php`, `Ticket.php`, `TicketPolicy.php`, tests `TicketWorkflowTest`, `TicketScopeTest`, `ConsistencyTest`, `MySqlConcurrencyTest` |
+| 25 | Modifications | Allow admins as assignees: change `canBeAssignedTo()` and `eligibleAgents()`; change lock timing in `config/resolvedesk.php`. |
 
-#### `assignAgent()` and the row lock
+#### `assignAgent()`, the locks and the lock order
 
 ```php
-public function assignAgent(Ticket $ticket, User $agent, User $admin): bool
+public function assignAgent(Ticket $ticket, User $agent, User $admin, ?int $expectedVersion = null): bool
 {
-    $wasChanged = DB::transaction(function () use ($ticket, $agent, $admin) {
-        $lockedTicket = $this->lockTicket($ticket);
+    $wasChanged = $this->withAssignmentLock(function () use ($ticket, $agent, $admin, $expectedVersion) {
+        // DB::transaction(..., 3): retry up to 3 times if MySQL reports a deadlock.
+        return DB::transaction(function () use ($ticket, $agent, $admin, $expectedVersion) {
+            $lockedTicket = $this->lockProjectAndTicket($ticket);
+            $lockedTicket->ensureVersion($expectedVersion);
 
-        return $this->performAssignment($lockedTicket, $agent, $admin);
+            return $this->performAssignment($lockedTicket, $agent, $admin);
+        }, 3);
     });
 
     if ($wasChanged) {
-        $this->clearDashboardCache();
+        Cache::forget(TicketService::DASHBOARD_CACHE_KEY);
     }
 
     return $wasChanged;
 }
 
-private function lockTicket(Ticket $ticket): Ticket
+private function lockProjectAndTicket(Ticket $ticket): Ticket
 {
+    if ($ticket->project_id !== null) {
+        Project::whereKey($ticket->project_id)->sharedLock()->first();
+    }
+
     return Ticket::whereKey($ticket->id)->lockForUpdate()->firstOrFail();
 }
 ```
 
-- `whereKey($id)` = `WHERE id = ?`. `lockForUpdate()` adds `FOR UPDATE`. `firstOrFail()` = `LIMIT 1` or 404.
-- SQL: `SELECT * FROM tickets WHERE tickets.id = 7 LIMIT 1 FOR UPDATE;`
-- The lock is held **until COMMIT/ROLLBACK**. A second admin clicking at the same moment waits, then reads the
-  **updated** row, and the checks run on fresh data.
-- Why re-read? The `$ticket` from route model binding was loaded **before** the transaction; it may be stale.
+```php
+private function withAssignmentLock(Closure $operation): mixed
+{
+    $lock = Cache::lock(
+        config('resolvedesk.assignment_lock.key'),
+        config('resolvedesk.assignment_lock.seconds')
+    );
 
-> **বাংলায়:** Row locking (`SELECT ... FOR UPDATE`) মানে টিকিটের row-টিতে তালা দেওয়া। দুইজন admin একই সময়ে একই
-> টিকিট assign করলে দ্বিতীয়জন অপেক্ষা করবে যতক্ষণ না প্রথমজনের transaction শেষ হয়; তারপর সে নতুন অবস্থা দেখে
-> সিদ্ধান্ত নেবে। এতে duplicate notification বা ভুল status-এর মতো race condition হয় না।
+    $this->notifier->holdSideEffects();
+
+    try {
+        return $lock->block(config('resolvedesk.assignment_lock.wait_seconds'), $operation);
+    } catch (LockTimeoutException) {
+        throw ValidationException::withMessages([
+            'ticket' => 'Another assignment is being processed right now. Please try again in a moment.',
+        ]);
+    } finally {
+        // Lock released (block() does that) -> now run the committed side effects.
+        $this->notifier->releaseSideEffects();
+    }
+}
+```
+
+| Layer | Why |
+|---|---|
+| `Cache::lock('ticket-assignment', 10)` | Two auto-assigns of **different** tickets would both count the same workload and pick the same agent. Row locks on different tickets do not stop that; one global lock does. Expires after 10 s if PHP crashes. |
+| Project `sharedLock()` | Blocks `ProjectService::syncAgents()` (which uses `FOR UPDATE`) until we commit, so "remove Sarah from HRMS" cannot interleave with "assign to Sarah". |
+| Ticket `lockForUpdate()` | Re-read the **current** row; the route-bound `$ticket` was loaded before the transaction. |
+| `ensureVersion()` | The admin decided based on version N; if the ticket changed, refuse. |
+| `holdSideEffects()` | No network calls (Reverb) while holding the global lock; they run in `finally` after release. |
+
+`catch (LockTimeoutException)` without a variable is PHP 8 syntax for "catch, but I do not need the object".
+`finally` always runs — after success **and** after an exception.
 
 #### `performAssignment()` block by block
 
@@ -1148,30 +1221,23 @@ private function performAssignment(Ticket $ticket, User $agent, User $admin): bo
             'ticket' => 'Only Open, Assigned or In Progress tickets can be assigned.',
         ]);
     }
-```
 
-Status re-check on the **locked** row (the policy checked the possibly stale copy).
-
-```php
-    // Re-read the agent from the database: never trust that the selected user is still an active agent.
-    $agent = User::find($agent->id);
-    if ($agent === null || ! $agent->isAgent() || ! $agent->is_active) {
-        throw ValidationException::withMessages([
-            'agent_id' => 'Please select an active support agent.',
-        ]);
+    // Re-read the agent WITH a row lock (audit fix A-2): UserController locks the same
+    // row before deactivating/demoting, so "assign to X" and "deactivate X" cannot interleave.
+    $agent = User::whereKey($agent->id)->lockForUpdate()->first();
+    if ($agent === null || ! $ticket->canBeAssignedTo($agent)) {
+        $message = $ticket->project_id === null
+            ? 'Please select an active support agent.'
+            : 'Please select an active support agent who supports this ticket\'s project.';
+        throw ValidationException::withMessages(['agent_id' => $message]);
     }
-```
 
-The form rule only proves the id **exists**. This check ensures it is an **active agent** — a customer id or a
-deactivated agent is rejected.
-
-```php
-    // Duplicate prevention: same agent => nothing to do.
+    // Duplicate prevention: same agent => nothing to do, no version change.
     if ($ticket->assigned_to === $agent->id) {
         return false;
     }
 
-    $previousAgent = $ticket->assignedAgent; // null if the ticket was unassigned
+    $previousAgent = $ticket->assigned_to ? User::find($ticket->assigned_to) : null;
     $previousStatusLabel = $ticket->statusLabel();
 
     $ticket->assigned_to = $agent->id;
@@ -1179,100 +1245,105 @@ deactivated agent is rejected.
         $ticket->status = Ticket::STATUS_ASSIGNED; // Open -> Assigned happens through assignment.
     }
     // Reassignment keeps the current status (Assigned or In Progress).
+    $ticket->version = $ticket->version + 1;
     $ticket->save();
-    $ticket->setRelation('assignedAgent', $agent);
 ```
 
-- `return false` → no activity, no notification, no email (duplicate prevention).
-- `$ticket->assignedAgent` is read **before** `assigned_to` changes, so we still know the old agent.
-  (This is a lazy load, but on a single model — `preventLazyLoading` only complains when the model came from a
-  multi-row result.)
-- `setRelation('assignedAgent', $agent)` updates the cached relationship so later code sees the new agent without
-  another query.
+- `canBeAssignedTo()` (V2) = active agent AND (global ticket OR `project_user` row exists). Always read from
+  the database, never cached.
+- The previous agent is read with `User::find()` **before** `assigned_to` changes.
 
 ```php
     if ($previousAgent === null) {
-        $this->recordActivity($ticket, $admin, 'assigned', null, $agent->name);
-        $this->recordActivity($ticket, $admin, 'status_changed', $previousStatusLabel, $ticket->statusLabel());
+        TicketActivity::record($ticket, $admin, 'assigned', null, $agent->name);
+        TicketActivity::record($ticket, $admin, 'status_changed', $previousStatusLabel, $ticket->statusLabel());
 
-        $this->notifyUser($agent, $ticket, $admin, 'assigned',
+        $this->notifier->notify($agent, $ticket, $admin, 'assigned',
             'New ticket assigned',
             "Ticket {$ticket->ticket_number} \"{$ticket->subject}\" has been assigned to you.",
             true);
     } else {
-        $this->recordActivity($ticket, $admin, 'reassigned', $previousAgent->name, $agent->name);
+        TicketActivity::record($ticket, $admin, 'reassigned', $previousAgent->name, $agent->name);
 
-        $this->notifyUser($agent, $ticket, $admin, 'reassigned',
+        $this->notifier->notify($agent, $ticket, $admin, 'reassigned',
             'Ticket reassigned to you',
             "Ticket {$ticket->ticket_number} \"{$ticket->subject}\" has been reassigned to you.",
             true);
+
+        // The previous agent loses access, so the message contains only the ticket number.
+        $this->notifier->notify($previousAgent, $ticket, $admin, 'unassigned',
+            'Ticket reassigned to another agent',
+            "Ticket {$ticket->ticket_number} is no longer assigned to you.",
+            false);
     }
 
     return true;
 }
 ```
 
-- `\"` inside a double-quoted string prints a literal `"`.
-- The last argument `true` = also send an email.
-- On reassignment only the **new** agent is notified.
-
-Equivalent SQL (first assignment of ticket 7 to agent 5 by admin 1):
+Equivalent SQL (first assignment of ticket 41, HRMS, to Sarah id 2 by admin 1):
 
 ```sql
+INSERT INTO cache_locks (`key`, owner, expiration) VALUES ('resolvedesk-cache-ticket-assignment', '<random>', <now+10>);
 START TRANSACTION;
-SELECT * FROM tickets WHERE id = 7 LIMIT 1 FOR UPDATE;
-SELECT * FROM users WHERE id = 5 LIMIT 1;
-UPDATE tickets SET assigned_to = 5, status = 'assigned', updated_at = NOW() WHERE id = 7;
-INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, created_at, updated_at)
-VALUES (7, 1, 'assigned', NULL, 'Sarah Ahmed', NOW(), NOW());
-INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, created_at, updated_at)
-VALUES (7, 1, 'status_changed', 'Open', 'Assigned', NOW(), NOW());
-INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, read_at, created_at, updated_at)
-VALUES ('<uuid>', 'App\\Notifications\\TicketNotification', 'App\\Models\\User', 5,
-        '{"ticket_id":7,"ticket_number":"TK-000007","title":"New ticket assigned",...}', NULL, NOW(), NOW());
+SELECT * FROM projects WHERE id = 1 LIMIT 1 LOCK IN SHARE MODE;
+SELECT * FROM tickets WHERE id = 41 LIMIT 1 FOR UPDATE;
+SELECT * FROM users WHERE id = 2 LIMIT 1;
+SELECT EXISTS(SELECT * FROM project_user WHERE project_id = 1 AND user_id = 2) AS `exists`;
+UPDATE tickets SET assigned_to = 2, status = 'assigned', version = 2, updated_at = NOW() WHERE id = 41;
+INSERT INTO ticket_activities (...) VALUES (41, 1, 'assigned', NULL, 'Sarah Ahmed', 0, ...);
+INSERT INTO ticket_activities (...) VALUES (41, 1, 'status_changed', 'Open', 'Assigned', 0, ...);
+INSERT INTO notifications (... notifiable_id = 2 ...);
 COMMIT;
--- DB::afterCommit callback:
-INSERT INTO jobs (queue, payload, attempts, reserved_at, available_at, created_at)
-VALUES ('default', '{..."SendTicketEmail"...}', 0, NULL, <unix time>, <unix time>);
--- clearDashboardCache():
+DELETE FROM cache_locks WHERE `key` = 'resolvedesk-cache-ticket-assignment' AND owner = '<random>';
+-- released side effects: broadcast + INSERT INTO jobs (...)
 DELETE FROM cache WHERE `key` = 'resolvedesk-cache-dashboard:admin:stats';
 ```
+
+> **বাংলায়:** তিন স্তরের সুরক্ষা: (১) cache lock — একসাথে একটাই assignment, (২) project row-এ shared lock —
+> assignment চলাকালীন কেউ agent-কে project থেকে সরাতে পারবে না, (৩) ticket row-এ FOR UPDATE + version check।
+> Lock-গুলো সবসময় একই ক্রমে নেওয়া হয় (cache lock → project → ticket), তাই deadlock হয় না।
 
 ### 5.2 Operation: Auto assign
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Balance workload: give an Open ticket to the active agent with the fewest Assigned + In Progress tickets. |
+| 1 | Business purpose | Give an Open ticket to the **eligible** agent with the fewest Assigned + In Progress tickets (counted across all projects). |
 | 2 | User roles | Admin. |
-| 3 | UI page | Ticket details → Actions card (only while the status is Open). |
-| 4 | UI actions | **Auto Assign** (JS confirm). |
+| 3 | UI page | Ticket details → Actions card (only while Open). |
+| 4 | UI actions | **Auto Assign** (confirm). |
 | 5 | Blade | `tickets/show.blade.php`: `@if ($ticket->status === \App\Models\Ticket::STATUS_OPEN)` form inside `@can('assign', $ticket)`. |
 | 6 | On click | Confirm → POST. |
-| 7 | Form data | `_token` only. |
+| 7 | Form data | `version`. |
 | 8 | Method + URL | `POST /tickets/{ticket}/auto-assign` |
 | 9 | Route | `tickets.auto-assign` |
 | 10 | Middleware | `auth`, `active`, `role:admin` |
 | 11 | Controller | `TicketController::autoAssign(Request $request, Ticket $ticket)` |
-| 12 | Validation | Service: ticket must be Open, else `'Auto assign is only available for Open tickets. Use Reassign instead.'` |
+| 12 | Validation | `version` nullable integer; service: Open only ("Auto assign is only available for Open tickets. Use Reassign instead."). |
 | 13 | Authorization | `Gate::authorize('assign', $ticket)` |
-| 14 | Business logic | Lock → Open check → `findLeastBusyAgent()` → none? return `null` (no change) → `performAssignment()`. |
-| 15 | Eloquent | `User::where(...)->withCount([...])->orderBy('workload_count')->orderBy('id')->first()` |
-| 16 | SQL | see below |
-| 17 | DB changes | Same as manual assignment; nothing if no agent is available. |
+| 14 | Business logic | Same locks as manual → Open check → `findLeastBusyAgent($lockedTicket->project_id)` inside the lock → none? `null` (nothing written) → `performAssignment()`. |
+| 15 | Eloquent | `User::where(...)->when(...)->whereHas('projects', ...)->withCount([...])->orderBy('workload_count')->orderBy('id')->first()` |
+| 16 | SQL | see [22 — 8.2](22-V2-BUSINESS-FEATURES.md#82-least-workload-auto-assign--findleastbusyagent) |
+| 17 | DB changes | Same as manual assignment; nothing if no agent is eligible. |
 | 18 | Notification | "New ticket assigned" to the chosen agent. |
 | 19 | Queue | Email job to the chosen agent. |
-| 20 | Cache | `clearDashboardCache()` only if an agent was chosen. |
-| 21 | Response | `back()->with('success', "Ticket automatically assigned to {$agent->name} (lowest current workload).")` or `back()->with('error', 'No active support agent is available. The ticket remains Open.')` |
-| 22 | Blade | Details page refreshed. |
-| 23 | Errors | Not Open → validation error in the flash box. |
-| 24 | Files | `TicketService.php`, `tests/Feature/TicketWorkflowTest.php` (`test_auto_assign_picks_agent_with_lowest_workload`, `test_auto_assign_uses_lowest_user_id_as_tie_breaker`, `test_auto_assign_without_active_agents_leaves_ticket_open`) |
-| 25 | Modifications | Count only high/critical tickets as workload (change the closure); prefer agents with a category skill (needs a new table). |
+| 20 | Cache | Dashboard key cleared only if an agent was chosen. Workload is never cached. |
+| 21 | Response | `back()->with('success', "Ticket automatically assigned to {$agent->name} (lowest current workload).")` or `back()->with('error', "No eligible {$scope} is available. The ticket remains Open.")` where `$scope` is "active support agent" or "active support agent for this project". |
+| 22 | Blade | Details page refreshed; Auto Assign button disappears. |
+| 23 | Errors | Not Open → validation error; stale version → conflict; lock timeout → message. |
+| 24 | Files | `TicketAssignmentService.php`, tests `TicketWorkflowTest` (`test_auto_assign_picks_agent_with_lowest_workload`, `test_auto_assign_uses_lowest_user_id_as_tie_breaker`), `TicketScopeTest` (`test_auto_assign_considers_only_project_agents_but_counts_all_workload`, `test_auto_assign_with_no_project_agent_leaves_ticket_open`) |
+| 25 | Modifications | Count only this project's tickets as workload: add `->where('project_id', $projectId)` in the `withCount` closure. |
 
 ```php
-public function findLeastBusyAgent(): ?User
+public function findLeastBusyAgent(?int $projectId = null): ?User
 {
     return User::where('role', User::ROLE_AGENT)
         ->where('is_active', true)
+        ->when($projectId !== null, function ($query) use ($projectId) {
+            $query->whereHas('projects', function ($projectQuery) use ($projectId) {
+                $projectQuery->where('projects.id', $projectId);
+            });
+        })
         ->withCount(['assignedTickets as workload_count' => function ($query) {
             $query->whereIn('status', Ticket::WORKLOAD_STATUSES);
         }])
@@ -1282,40 +1353,12 @@ public function findLeastBusyAgent(): ?User
 }
 ```
 
-Equivalent SQL (from the method's own comment):
+- `when($condition, $callback)` runs the callback only when the condition is true (here: project tickets).
+- `whereHas('projects', ...)` → `EXISTS (SELECT ... FROM projects INNER JOIN project_user ...)`.
+- `orderBy('id')` is the deterministic tie-breaker.
+- This is workload-based task distribution, not server load balancing.
 
-```sql
-SELECT users.*, (SELECT COUNT(*) FROM tickets
-                 WHERE tickets.assigned_to = users.id
-                 AND tickets.status IN ('assigned','in_progress')) AS workload_count
-FROM users
-WHERE role = 'agent' AND is_active = 1
-ORDER BY workload_count ASC, id ASC      -- id = deterministic tie-breaker
-LIMIT 1;
-```
-
-- `?User` return type: `first()` returns `null` when there is no active agent.
-- `orderBy('id')` is a **tie-breaker**: with equal workloads the lowest id wins, so the result is predictable and
-  testable.
-- Resolved/Closed tickets are not workload (`WORKLOAD_STATUSES` = assigned, in_progress).
-
-Inside `autoAssign()`:
-
-```php
-$agent = $this->findLeastBusyAgent();
-
-if ($agent === null) {
-    return null; // Nothing changes: no activity, no notification, no email.
-}
-
-$this->performAssignment($lockedTicket, $agent, $admin);
-
-return $agent;
-```
-
-> **বাংলায়:** Auto assign-এর নিয়ম সহজ: যে active agent-এর হাতে এই মুহূর্তে সবচেয়ে কম Assigned + In Progress টিকিট,
-> তাকেই দাও। সমান হলে যার id ছোট সে পাবে, যাতে ফলাফল সবসময় একই (deterministic) হয় এবং test করা যায়।
-> কোনো active agent না থাকলে টিকিট Open অবস্থায় থেকে যায়।
+Full walkthrough: [22 — 15.4](22-V2-BUSINESS-FEATURES.md#154-auto-assign-a-project-ticket).
 
 ---
 
@@ -1340,20 +1383,37 @@ public function canPerform(string $action): bool
 ```mermaid
 stateDiagram-v2
     [*] --> open: create
-    open --> assigned: assign or auto assign (admin)
+    open --> assigned: assign or auto assign (admin, eligible agent)
     assigned --> in_progress: start (agent or admin)
     in_progress --> resolved: resolve with note (agent or admin)
     resolved --> closed: close (creator or admin)
-    resolved --> in_progress: reopen (creator or admin)
+    resolved --> in_progress: reopen (creator or admin, agent still eligible)
     closed --> [*]
 ```
 
 `canPerform()` is used **twice**: in `TicketPolicy` (hide button / 403) and in
-`TicketService::ensureActionAllowed()` on the locked row (in case the status changed between page load and click).
+`TicketService::ensureActionAllowed()` on the locked row.
+
+V2 changes common to all four actions:
+
+- Every form sends the hidden `version`; the controller passes `$this->expectedVersion($request)` (`null` if not
+  sent → no check, used by tests/older callers) and the service calls `$lockedTicket->ensureVersion(...)`.
+- `DB::transaction(..., 3)` (deadlock retry).
+- `saveNewVersion()` increments `version` on every save.
+- Activities via `TicketActivity::record()`, notifications via `$this->notifier->notify()` (`TicketNotifier`).
+
+```php
+/** Every ticket mutation increments the optimistic-locking version. */
+private function saveNewVersion(Ticket $ticket): void
+{
+    $ticket->version = $ticket->version + 1;
+    $ticket->save();
+}
+```
 
 > **বাংলায়:** একটি টিকিট কোন অবস্থা থেকে কোন অবস্থায় যেতে পারবে তা `Ticket::TRANSITIONS`-এ এক জায়গায় লেখা আছে।
-> Policy এটি দেখে বোতাম দেখায় বা লুকায়, আর service lock করা row-এ আবার এটি যাচাই করে। তাই কেউ সরাসরি POST
-> পাঠিয়েও Closed টিকিটকে In Progress করতে পারবে না।
+> Policy এটি দেখে বোতাম দেখায় বা লুকায়, আর service lock করা row-এ আবার যাচাই করে। V2-তে প্রতিটা পরিবর্তনে
+> `version` এক বাড়ে, তাই পুরোনো page থেকে পাঠানো request ধরা পড়ে।
 
 ### 6.1 Operation: Start working
 
@@ -1364,39 +1424,37 @@ stateDiagram-v2
 | 3 | UI page | Ticket details. |
 | 4 | UI actions | **Start Working** (confirm). |
 | 5 | Blade | `tickets/show.blade.php` `@can('start', $ticket)` |
-| 6 | On click | Confirm → POST. |
-| 7 | Form data | `_token`. |
+| 6–7 | On click / data | Confirm → POST `version`. |
 | 8 | Method + URL | `POST /tickets/{ticket}/start` |
 | 9 | Route | `tickets.start` |
 | 10 | Middleware | `auth`, `active` |
 | 11 | Controller | `TicketController::start()` |
-| 12 | Validation | Service: `ensureActionAllowed($lockedTicket, 'start')` |
-| 13 | Authorization | `TicketPolicy::start()`: (admin **or** assigned agent) **and** `$ticket->canPerform('start')` |
-| 14 | Business logic | Assigned → In Progress; activity `status_changed` Assigned → In Progress. |
-| 15 | Eloquent | `lockTicket()`, `save()`, `TicketActivity::create()` |
-| 16 | SQL | `SELECT * FROM tickets WHERE id = 7 LIMIT 1 FOR UPDATE;` · `UPDATE tickets SET status = 'in_progress', updated_at = NOW() WHERE id = 7;` · `INSERT INTO ticket_activities (..., action, old_value, new_value) VALUES (..., 'status_changed', 'Assigned', 'In Progress');` |
-| 17 | DB changes | status + 1 activity. |
-| 18 | Notification | None. |
-| 19 | Queue | None. |
+| 12 | Validation | `version` nullable integer; service `ensureVersion()` + `ensureActionAllowed($lockedTicket, 'start')` |
+| 13 | Authorization | `TicketPolicy::start()`: (admin **or** assigned agent) **and** `canPerform('start')` |
+| 14 | Business logic | Assigned → In Progress; version + 1; activity `status_changed` Assigned → In Progress. |
+| 15–16 | Eloquent / SQL | `SELECT * FROM tickets WHERE id = 41 LIMIT 1 FOR UPDATE;` · `UPDATE tickets SET status = 'in_progress', version = 3, updated_at = NOW() WHERE id = 41;` · activity INSERT |
+| 17 | DB changes | status, version + 1 activity. |
+| 18–19 | Notification / Queue | None. |
 | 20 | Cache | `clearDashboardCache()` |
 | 21 | Response | `back()->with('success', 'Ticket is now In Progress.')` |
-| 22 | Blade | Badge "In Progress"; the Resolve form now appears. |
-| 23 | Errors | Wrong status → 403 (policy) or "This action is not allowed while the ticket is ..." (service). |
+| 22 | Blade | Badge "In Progress"; the Resolve form appears. |
+| 23 | Errors | Wrong status → 403 or "This action is not allowed while the ticket is ..."; stale version → conflict. |
 | 24 | Files | `TicketController.php`, `TicketService.php` (`startWork`), `TicketPolicy.php` |
-| 25 | Modifications | Notify the customer that work started: add `$this->notifyUser($lockedTicket->creator, ...)`. |
+| 25 | Modifications | Notify the customer that work started: add `$this->notifier->notify($lockedTicket->creator, ...)`. |
 
 ```php
-public function startWork(Ticket $ticket, User $user): void
+public function startWork(Ticket $ticket, User $user, ?int $expectedVersion = null): void
 {
-    DB::transaction(function () use ($ticket, $user) {
+    DB::transaction(function () use ($ticket, $user, $expectedVersion) {
         $lockedTicket = $this->lockTicket($ticket);
+        $lockedTicket->ensureVersion($expectedVersion);
         $this->ensureActionAllowed($lockedTicket, 'start');
 
         $lockedTicket->status = Ticket::STATUS_IN_PROGRESS;
-        $lockedTicket->save();
+        $this->saveNewVersion($lockedTicket);
 
-        $this->recordActivity($lockedTicket, $user, 'status_changed', 'Assigned', 'In Progress');
-    });
+        TicketActivity::record($lockedTicket, $user, 'status_changed', 'Assigned', 'In Progress');
+    }, 3);
 
     $this->clearDashboardCache();
 }
@@ -1408,62 +1466,41 @@ public function startWork(Ticket $ticket, User $user): void
 |---|---|---|
 | 1 | Business purpose | The agent records the fix and asks the customer to confirm. |
 | 2 | User roles | Assigned agent or admin. |
-| 3 | UI page | Ticket details. |
-| 4 | UI actions | Type a **Resolution note** → **Resolve Ticket** (confirm). |
-| 5 | Blade | `tickets/show.blade.php` `@can('resolve', $ticket)`; textarea `resolution_note` with `old('resolution_note')` and `@error('resolution_note')`. |
-| 6 | On click | Confirm → POST. |
-| 7 | Form data | `resolution_note`. |
-| 8 | Method + URL | `POST /tickets/{ticket}/resolve` |
-| 9 | Route | `tickets.resolve` |
-| 10 | Middleware | `auth`, `active` |
-| 11 | Controller | `TicketController::resolve()` |
-| 12 | Validation | `'resolution_note' => ['required', 'string', 'max:5000']`; the service also rejects whitespace-only notes (`trim($resolutionNote) === ''`). |
+| 3–5 | UI | Ticket details; **Resolution note** + **Resolve Ticket**; `@can('resolve', $ticket)`. |
+| 7 | Form data | `resolution_note`, `version`. |
+| 8–9 | URL / route | `POST /tickets/{ticket}/resolve` · `tickets.resolve` |
+| 10–11 | Middleware / controller | `auth`, `active` · `TicketController::resolve()` |
+| 12 | Validation | `resolution_note` required string max 5000; service rejects whitespace-only notes; `ensureVersion()`. |
 | 13 | Authorization | `TicketPolicy::resolve()` |
-| 14 | Business logic | In Progress → Resolved; set `resolved_at = now()` and `resolution_note`; activity `resolved`; notify the creator (+ email). |
-| 15 | Eloquent | `lockTicket()`, `save()`, `TicketActivity::create()`, `$lockedTicket->creator`, `notify()` |
-| 16 | SQL | `UPDATE tickets SET status = 'resolved', resolved_at = NOW(), resolution_note = '...', updated_at = NOW() WHERE id = 7;` + activity INSERT + notifications INSERT; after commit a jobs INSERT |
-| 17 | DB changes | ticket, activity, notification, job. |
-| 18 | Notification | To the creator: "Ticket resolved" — "Ticket TK-000007 has been resolved. Please review the resolution note." |
+| 14 | Business logic | In Progress → Resolved; `resolved_at = now()`, `resolution_note`; version + 1; activity `resolved`; notify the creator (+ email). |
+| 16 | SQL | `UPDATE tickets SET status = 'resolved', resolved_at = NOW(), resolution_note = '...', version = 4, updated_at = NOW() WHERE id = 41;` + activity + notification; after commit a job |
+| 18 | Notification | Creator: "Ticket resolved" — "Ticket TK-000041 has been resolved. Please review the resolution note." |
 | 19 | Queue | `SendTicketEmail` to the creator. |
-| 20 | Cache | `clearDashboardCache()` (status counts and average resolution time change). |
+| 20 | Cache | `clearDashboardCache()` |
 | 21 | Response | `back()->with('success', 'Ticket marked as Resolved.')` |
-| 22 | Blade | Green "Resolution Note" card; the customer now sees **Confirm & Close** and **Reopen**. |
-| 23 | Errors | Empty note → back with `@error`. |
-| 24 | Files | `TicketService.php` (`resolve`), `tests/Feature/TicketWorkflowTest.php` (`test_resolution_note_is_required`) |
-| 25 | Modifications | Add a "resolution category" dropdown (column + validation + `$lockedTicket->...` assignment). |
+| 22 | Blade | Resolution card; SLA panel shows "Resolved within SLA" / "Resolved after SLA"; customer sees Close and Reopen. |
+| 24 | Files | `TicketService.php` (`resolve`), `tests/Feature/TicketWorkflowTest.php` |
+| 25 | Modifications | Add a "resolution category" (column + validation + assignment). |
 
 ```php
-public function resolve(Ticket $ticket, string $resolutionNote, User $user): void
-{
-    if (trim($resolutionNote) === '') {
-        throw ValidationException::withMessages([
-            'resolution_note' => 'A resolution note is required to resolve a ticket.',
-        ]);
-    }
+DB::transaction(function () use ($ticket, $resolutionNote, $user, $expectedVersion) {
+    $lockedTicket = $this->lockTicket($ticket);
+    $lockedTicket->ensureVersion($expectedVersion);
+    $this->ensureActionAllowed($lockedTicket, 'resolve');
 
-    DB::transaction(function () use ($ticket, $resolutionNote, $user) {
-        $lockedTicket = $this->lockTicket($ticket);
-        $this->ensureActionAllowed($lockedTicket, 'resolve');
+    $lockedTicket->status = Ticket::STATUS_RESOLVED;
+    $lockedTicket->resolved_at = now();
+    $lockedTicket->resolution_note = $resolutionNote;
+    $this->saveNewVersion($lockedTicket);
 
-        $lockedTicket->status = Ticket::STATUS_RESOLVED;
-        $lockedTicket->resolved_at = now();
-        $lockedTicket->resolution_note = $resolutionNote;
-        $lockedTicket->save();
+    TicketActivity::record($lockedTicket, $user, 'resolved', 'In Progress', 'Resolved');
 
-        $this->recordActivity($lockedTicket, $user, 'resolved', 'In Progress', 'Resolved');
-
-        $this->notifyUser($lockedTicket->creator, $lockedTicket, $user, 'resolved',
-            'Ticket resolved',
-            "Ticket {$lockedTicket->ticket_number} has been resolved. Please review the resolution note.",
-            true);
-    });
-
-    $this->clearDashboardCache();
-}
+    $this->notifier->notify($lockedTicket->creator, $lockedTicket, $user, 'resolved',
+        'Ticket resolved',
+        "Ticket {$lockedTicket->ticket_number} has been resolved. Please review the resolution note.",
+        true);
+}, 3);
 ```
-
-The service repeats the "note required" check because a service should protect its own rules even when it is called
-from somewhere other than this controller (a test, a future API).
 
 ### 6.3 Operation: Reopen
 
@@ -1471,51 +1508,41 @@ from somewhere other than this controller (a test, a future API).
 |---|---|---|
 | 1 | Business purpose | The customer is not satisfied: send the ticket back to the same agent. |
 | 2 | User roles | Ticket creator or admin. |
-| 3 | UI page | Ticket details (status Resolved). |
-| 4 | UI actions | **Reopen Ticket** (confirm). |
-| 5 | Blade | `tickets/show.blade.php` `@can('reopen', $ticket)` |
-| 6 | On click | Confirm → POST. |
-| 7 | Form data | `_token`. |
-| 8 | Method + URL | `POST /tickets/{ticket}/reopen` |
-| 9 | Route | `tickets.reopen` |
-| 10 | Middleware | `auth`, `active` |
+| 3–5 | UI | Ticket details (Resolved); **Reopen Ticket**; `@can('reopen', $ticket)`. |
+| 7 | Form data | `version`. |
+| 8–9 | URL / route | `POST /tickets/{ticket}/reopen` · `tickets.reopen` |
 | 11 | Controller | `TicketController::reopen()` |
-| 12 | Validation | Service: transition allowed; the assigned agent must exist and be active. |
-| 13 | Authorization | `TicketPolicy::reopen()`: (admin **or** creator) **and** `$ticket->canPerform('reopen')` |
-| 14 | Business logic | Resolved → In Progress; clear `resolved_at` and `resolution_note`; keep the old note in the activity; keep the original `due_at`. |
-| 15 | Eloquent | `lockTicket()`, `$lockedTicket->assignedAgent`, `save()`, `TicketActivity::create()`, `notify()` |
-| 16 | SQL | `UPDATE tickets SET status = 'in_progress', resolved_at = NULL, resolution_note = NULL, updated_at = NOW() WHERE id = 7;` + activity INSERT (old_value `'Previous resolution: ...'`) + notifications INSERT; after commit a jobs INSERT |
-| 17 | DB changes | ticket, activity, notification, job. |
-| 18 | Notification | To the assigned agent: "Ticket reopened" — "... was reopened and needs more work." |
+| 12 | Validation | Transition allowed; V2: the assigned agent must still be **eligible** (`canBeAssignedTo()`: active and, for project tickets, still a member). |
+| 13 | Authorization | `TicketPolicy::reopen()` |
+| 14 | Business logic | Resolved → In Progress; clear `resolved_at`, `resolution_note`, V2 `sla_notified_at`; keep the old note in the activity; keep the original `due_at`. |
+| 16 | SQL | `UPDATE tickets SET status = 'in_progress', resolved_at = NULL, resolution_note = NULL, sla_notified_at = NULL, version = 5, ... WHERE id = 41;` + activity + notification |
+| 18 | Notification | Assigned agent: "Ticket reopened" — "... was reopened and needs more work." |
 | 19 | Queue | Email to the agent. |
-| 20 | Cache | `clearDashboardCache()` |
 | 21 | Response | `back()->with('success', 'Ticket reopened and moved back to In Progress.')` |
-| 22 | Blade | Status In Progress; the resolution card disappears; the timeline shows the previous resolution as the struck-through old value. If `due_at` has passed, the Overdue badge appears immediately. |
-| 23 | Errors | Agent inactive → "This ticket cannot be reopened because its assigned agent is not active. Please contact an administrator." |
-| 24 | Files | `TicketService.php` (`reopen`), `tests/Feature/TicketWorkflowTest.php` (`test_creator_can_reopen_a_resolved_ticket`, `test_reopen_requires_an_active_assigned_agent`) |
-| 25 | Modifications | Give a fresh SLA on reopen: set `$lockedTicket->due_at = Ticket::calculateDueAt(now(), $lockedTicket->priority);` and record a `due_date_changed` activity. |
+| 23 | Errors | "This ticket cannot be reopened because its assigned agent is no longer active or no longer supports this project. Please contact an administrator." |
+| 24 | Files | `TicketService.php` (`reopen`), tests `TicketWorkflowTest`, `SlaReportsAndHardeningTest::test_reopening_resets_the_reminder_so_a_new_breach_is_reported` |
+| 25 | Modifications | Fresh SLA on reopen: set `due_at = Ticket::calculateDueAt(now(), ...)` and record `due_date_changed` (the spec asks NOT to silently reset an overdue SLA, so document it). |
 
 ```php
-$agent = $lockedTicket->assignedAgent;
-if ($agent === null || ! $agent->is_active) {
-    throw ValidationException::withMessages([
-        'ticket' => 'This ticket cannot be reopened because its assigned agent is not active. Please contact an administrator.',
-    ]);
+// The assigned agent must STILL be eligible (active, and still in the project).
+$agent = $lockedTicket->assigned_to ? User::find($lockedTicket->assigned_to) : null;
+if ($agent === null || ! $lockedTicket->canBeAssignedTo($agent)) {
+    throw ValidationException::withMessages([...]);
 }
 
-// Keep the old note in the activity history before clearing it.
-$previousNote = $lockedTicket->resolution_note;
+$previousNote = $lockedTicket->resolution_note; // kept in the activity history
 
 $lockedTicket->status = Ticket::STATUS_IN_PROGRESS;
 $lockedTicket->resolved_at = null;
 $lockedTicket->resolution_note = null;
-$lockedTicket->save();
+$lockedTicket->sla_notified_at = null;
+$this->saveNewVersion($lockedTicket);
 
-$this->recordActivity($lockedTicket, $user, 'reopened', 'Previous resolution: ' . $previousNote, 'In Progress');
+TicketActivity::record($lockedTicket, $user, 'reopened', 'Previous resolution: ' . $previousNote, 'In Progress');
 ```
 
-Why must the agent be active? A reopened ticket is In Progress and needs a working owner. `UserController`'s rule 3
-(an agent with Resolved tickets cannot be deactivated) normally prevents this situation.
+`sla_notified_at = null`: if the original deadline has already passed, the reopened ticket is overdue at once, and
+the scheduler sends **one** fresh reminder for this new overdue period.
 
 ### 6.4 Operation: Close
 
@@ -1523,205 +1550,227 @@ Why must the agent be active? A reopened ticket is In Progress and needs a worki
 |---|---|---|
 | 1 | Business purpose | The customer confirms the fix; the ticket becomes read-only. |
 | 2 | User roles | Ticket creator or admin. |
-| 3 | UI page | Ticket details (status Resolved). |
-| 4 | UI actions | **Confirm & Close Ticket** (confirm: "Closed tickets cannot be changed."). |
-| 5 | Blade | `tickets/show.blade.php` `@can('close', $ticket)` |
-| 6 | On click | Confirm → POST. |
-| 7 | Form data | `_token`. |
-| 8 | Method + URL | `POST /tickets/{ticket}/close` |
-| 9 | Route | `tickets.close` |
-| 10 | Middleware | `auth`, `active` |
+| 3–5 | UI | Ticket details (Resolved); **Confirm & Close Ticket**; `@can('close', $ticket)`. |
+| 7 | Form data | `version`. |
+| 8–9 | URL / route | `POST /tickets/{ticket}/close` · `tickets.close` |
 | 11 | Controller | `TicketController::close()` |
-| 12 | Validation | `ensureActionAllowed($lockedTicket, 'close')` |
-| 13 | Authorization | `TicketPolicy::close()` |
-| 14 | Business logic | Resolved → Closed; `resolved_at` is kept; activity `closed`; notify the agent (in-app only). |
-| 15 | Eloquent | `lockTicket()`, `save()`, `TicketActivity::create()`, `$lockedTicket->assignedAgent`, `notify()` |
-| 16 | SQL | `UPDATE tickets SET status = 'closed', updated_at = NOW() WHERE id = 7;` + activity INSERT + notifications INSERT |
-| 17 | DB changes | ticket, activity, notification. |
-| 18 | Notification | To the assigned agent: "Ticket closed" — "... was confirmed and closed." |
+| 14 | Business logic | Resolved → Closed; `resolved_at` kept; version + 1; activity `closed`; notify the agent (in-app only). |
+| 18 | Notification | Assigned agent: "Ticket closed" — "... was confirmed and closed." |
 | 19 | Queue | **None** (`$sendEmail = false`). |
-| 20 | Cache | `clearDashboardCache()` |
 | 21 | Response | `back()->with('success', 'Ticket closed. Thank you for confirming the resolution.')` |
-| 22 | Blade | No Actions card; the comment form is replaced by "This ticket is closed and read-only."; the Edit button is hidden. |
-| 23 | Errors | Wrong status → 403 / validation error. |
-| 24 | Files | `TicketService.php` (`close`), `tests/Feature/TicketWorkflowTest.php` (`test_closed_tickets_are_read_only`) |
-| 25 | Modifications | Auto-close Resolved tickets after N days — would need the Laravel scheduler (**not implemented**). |
+| 22 | Blade | No Actions card; comment form replaced by "This ticket is closed and read-only."; Edit hidden. |
+| 25 | Modifications | Auto-close Resolved tickets after N days: a second scheduled command like `tickets:check-sla` (not implemented). |
 
-"Closed tickets are read-only" is enforced in several places: `TicketPolicy::update()` (returns false for closed),
-`TicketPolicy::comment()`, `TRANSITIONS` (no action starts from `closed`), `TicketPolicy::assign()` (closed is not
-in `ACTIVE_STATUSES`) and `TicketService::addComment()`.
+"Closed tickets are read-only" is enforced in: `TicketPolicy::update()`, `comment()`, `addInternalNote()`,
+`assign()`, `TRANSITIONS` (nothing starts from `closed`), `TicketService::addComment()` (locked re-check) and the
+`status <> 'closed'` condition of the optimistic UPDATE in `updateTicket()`.
 
 ---
 
-## 7. Comments
+## 7. Comments, internal notes and attachments
 
-Files: `app/Http/Controllers/TicketCommentController.php`, `TicketService::addComment()`,
-`app/Models/TicketComment.php`, `TicketPolicy::comment()`, `tickets/show.blade.php` (Conversation card).
+Files: `app/Http/Controllers/TicketCommentController.php`, `TicketService::addComment()` /
+`notifyCommentRecipients()`, `app/Models/TicketComment.php`, V2 `app/Services/AttachmentService.php`,
+`app/Models/TicketAttachment.php`, `app/Http/Controllers/TicketAttachmentController.php`,
+`TicketPolicy::comment()` / `addInternalNote()` / `downloadAttachment()`, `tickets/show.blade.php`.
 
-### 7.1 Operation: Add a comment
+### 7.1 Operation: Add a public reply or an internal note (with files)
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Conversation between customer, agent and admin on one ticket. |
-| 2 | User roles | Anyone who can view the ticket (admin, creator, assigned agent). |
+| 1 | Business purpose | Conversation between customer, agent and admin; V2: staff-only internal notes and file attachments. |
+| 2 | User roles | Anyone who can view the ticket (admin, creator, assigned agent). Internal notes: staff only. |
 | 3 | UI page | Ticket details → Conversation. |
-| 4 | UI actions | Type a message → **Post Comment**. |
-| 5 | Blade | `tickets/show.blade.php`: `@can('comment', $ticket)` form, `@else` "This ticket is closed and read-only." |
-| 6 | On click | POST form. |
-| 7 | Form data | `message`. |
+| 4 | UI actions | Message → (staff) Visibility "Public reply (customer can see)" / "Internal note (staff only)" → optional files → **Post**. |
+| 5 | Blade | `tickets/show.blade.php`: `@can('comment', $ticket)` form (`enctype="multipart/form-data"`), `@can('addInternalNote', $ticket)` select, `tickets/_attachment-input.blade.php`; `@else` "This ticket is closed and read-only." |
+| 6 | On click | POST form (`data-disable-on-submit`). |
+| 7 | Form data | `message`, `visibility`, `attachments[]`. |
 | 8 | Method + URL | `POST /tickets/{ticket}/comments` |
 | 9 | Route | `tickets.comments.store` |
-| 10 | Middleware | `auth`, `active` |
+| 10 | Middleware | `auth`, `active`, `throttle:comments` (30/min) |
 | 11 | Controller | `TicketCommentController::store(Request $request, Ticket $ticket)` |
-| 12 | Validation | `'message' => ['required', 'string', 'max:5000']`; service: ticket not Closed. |
-| 13 | Authorization | `Gate::authorize('comment', $ticket)` → `$this->view($user, $ticket) && ! $ticket->isClosed()` |
-| 14 | Business logic | Lock ticket, closed check, insert comment, notify creator and assigned agent except the author, no duplicates. |
-| 15 | Eloquent | `new TicketComment()`, `save()`, `$lockedTicket->creator`, `$lockedTicket->assignedAgent`, `notify()` |
-| 16 | SQL | `SELECT ... FOR UPDATE;` · `INSERT INTO ticket_comments (message, ticket_id, user_id, created_at, updated_at) VALUES (?, 7, 12, NOW(), NOW());` · `SELECT * FROM users WHERE id = 12 LIMIT 1;` (creator) · `SELECT * FROM users WHERE id = 5 LIMIT 1;` (agent) · 0–2 `INSERT INTO notifications ...` |
-| 17 | DB changes | 1 comment row, up to 2 notification rows. **No** activity row (comments are not part of the audit trail list in MASTER_PROMPT Module 6). |
-| 18 | Notification | "New comment from {name}" — "New comment on ticket TK-000007: {first 80 chars}..." |
-| 19 | Queue | **None** — no email per comment (spec: "Do not send an email for every comment"). |
-| 20 | Cache | None (the dashboard does not show comments). |
-| 21 | Response | `redirect()->to(route('tickets.show', $ticket) . '#conversation')->with('success', 'Comment added.')` |
-| 22 | Blade | Page scrolls to `id="conversation"`; the new comment shows author name, role badge, date. |
-| 23 | Errors | Empty message → `@error('message')`; closed ticket → 403 (policy) or the service message. |
-| 24 | Files | `TicketCommentController.php`, `TicketService.php`, `TicketComment.php`, `tests/Feature/NotificationTest.php` |
-| 25 | Modifications | Internal notes visible only to staff: add an `is_internal` column, a checkbox for agents/admins, and filter in the view for customers. |
-
-#### `addComment()` block by block
+| 12 | Validation | `message` required string max 5000; `visibility` nullable `Rule::in(array_keys(TicketComment::VISIBILITIES))`; `AttachmentService::validationRules()`; service: ticket not Closed. |
+| 13 | Authorization | `Gate::authorize('comment', $ticket)`; for `internal` also `Gate::authorize('addInternalNote', $ticket)`; service re-checks `isStaff()`. |
+| 14 | Business logic | Store files → transaction: lock ticket, closed check, INSERT comment (with visibility), activity (`comment_added` / `internal_note_added`), attachment rows + `attachment_added`, notify recipients. Failure → files deleted. |
+| 15 | Eloquent | `new TicketComment` + `save()`, `TicketActivity::record(..., $isInternal)`, `AttachmentService::createRecords()`, `$ticket->creator`, `$ticket->assignedAgent`, `notify()` |
+| 16 | SQL | see [22 — 15.2](22-V2-BUSINESS-FEATURES.md#152-add-an-internal-note-with-an-attachment) |
+| 17 | DB changes | 1 comment, 1–2 activities (V2: comments are now in the timeline), 0–5 attachment rows, 0–2 notifications. |
+| 18 | Notification | Public: creator + assigned agent except the author ("New comment from {name}"). Internal: assigned agent + creator only if staff ("Internal note from {name}"). |
+| 19 | Queue | V2: **customer's public reply → email to the assigned agent**. Everything else: no email. (V1 sent no email for comments.) |
+| 20 | Cache | None. |
+| 21 | Response | `redirect()->to(route('tickets.show', $ticket) . '#conversation')->with('success', "{$word} added.")` — "Comment added." / "Internal note added." |
+| 22 | Blade | New message with author, role badge, date; internal notes highlighted (`comment-internal`, "Internal note" badge); file buttons via `tickets/_attachments.blade.php`. |
+| 23 | Errors | Empty message / bad file → `@error`; customer `visibility=internal` → 403; closed → 403 (policy) or "Closed tickets are read-only. Comments are not allowed."; 31st per minute → 429. |
+| 24 | Files | `TicketCommentController.php`, `TicketService.php`, `AttachmentService.php`, `TicketComment.php`, tests `NotificationTest`, `InternalNotesAndAttachmentsTest` |
+| 25 | Modifications | Email for agent replies too: change the `$sendEmail` condition in `notifyCommentRecipients()`; new file type: `config/resolvedesk.php`. |
 
 ```php
-return DB::transaction(function () use ($ticket, $message, $author) {
-    $lockedTicket = $this->lockTicket($ticket);
+// app/Http/Controllers/TicketCommentController.php
+$visibility = $validated['visibility'] ?? TicketComment::VISIBILITY_PUBLIC;
 
-    if ($lockedTicket->isClosed()) {
-        throw ValidationException::withMessages([
-            'message' => 'Closed tickets are read-only. Comments are not allowed.',
-        ]);
-    }
+// Internal notes need the extra staff-only permission (a customer gets 403,
+// even if they edit the HTML form to send visibility=internal).
+if ($visibility === TicketComment::VISIBILITY_INTERNAL) {
+    Gate::authorize('addInternalNote', $ticket);
+}
 
-    $comment = new TicketComment();
-    $comment->message = $message;
-    $comment->ticket_id = $lockedTicket->id;
-    $comment->user_id = $author->id;
-    $comment->save();
+$this->ticketService->addComment(
+    $ticket,
+    $validated['message'],
+    $visibility,
+    $request->user(),
+    $request->file('attachments', [])
+);
 ```
 
-`TicketComment::$fillable` contains only `message`; `ticket_id` and `user_id` are assigned explicitly from the
-locked ticket and the logged-in user — never from the form.
+`addComment()` inside the transaction:
 
 ```php
-    $recipients = [$lockedTicket->creator, $lockedTicket->assignedAgent];
-    $alreadyNotifiedIds = [];
+$isInternal = $visibility === TicketComment::VISIBILITY_INTERNAL;
 
-    foreach ($recipients as $recipient) {
-        if ($recipient === null || in_array($recipient->id, $alreadyNotifiedIds, true)) {
-            continue; // No agent yet, or creator and agent are the same person.
-        }
-        $alreadyNotifiedIds[] = $recipient->id;
+$comment = new TicketComment;
+$comment->message = $message;
+$comment->visibility = $visibility;
+$comment->ticket_id = $lockedTicket->id;
+$comment->user_id = $author->id;
+$comment->save();
 
-        $this->notifyUser($recipient, $lockedTicket, $author, 'comment',
-            'New comment from ' . $author->name,
-            "New comment on ticket {$lockedTicket->ticket_number}: " . mb_strimwidth($message, 0, 80, '...'),
-            false);
-    }
+TicketActivity::record($lockedTicket, $author, $isInternal ? 'internal_note_added' : 'comment_added',
+    null, null, $isInternal);
 
-    return $comment;
-});
+if (count($storedFiles) > 0) {
+    $this->attachmentService->createRecords($storedFiles, $lockedTicket, $comment, $author);
+    TicketActivity::record($lockedTicket, $author, 'attachment_added', null, $this->fileList($storedFiles), $isInternal);
+}
+
+$this->notifyCommentRecipients($lockedTicket, $author, $message, $isInternal);
 ```
 
-- One simple rule covers every case: **notify the creator and the assigned agent, except the author.**
-  Customer comments → agent. Agent reply → customer. Admin comment → both.
-- `continue` skips to the next loop item. `$alreadyNotifiedIds[] = ...` appends to an array.
-- The author is skipped inside `notifyUser()` (`$recipient->id === $actor->id`).
-- `mb_strimwidth($message, 0, 80, '...')` cuts the text to 80 characters, **multibyte-safe** (Bangla text is not
-  broken in the middle of a character).
-- Tests: `test_creator_comment_notifies_only_the_assigned_agent`, `test_agent_reply_notifies_the_creator`,
-  `test_admin_comment_notifies_creator_and_agent`, `test_no_duplicate_when_creator_is_also_the_assigned_agent`.
+`notifyCommentRecipients()` (the recipient + email rule):
+
+```php
+if ($isInternal) {
+    // Staff participants only. A customer creator is never told about internal notes.
+    $recipients = [$agent];
+    if ($creator->isStaff()) {
+        $recipients[] = $creator;
+    }
+    ...
+} else {
+    $recipients = [$creator, $agent];
+    ...
+}
+
+$alreadyNotifiedIds = [];
+foreach ($recipients as $recipient) {
+    if ($recipient === null || in_array($recipient->id, $alreadyNotifiedIds, true)) {
+        continue; // no agent yet, or creator and agent are the same person
+    }
+    $alreadyNotifiedIds[] = $recipient->id;
+
+    // Email only for a customer's public reply to the assigned agent.
+    $sendEmail = ! $isInternal
+        && $author->isCustomer()
+        && $agent !== null
+        && $recipient->id === $agent->id;
+
+    $this->notifier->notify($recipient, $ticket, $author, $isInternal ? 'internal_note' : 'comment', $title, $text, $sendEmail);
+}
+```
+
+- The author is skipped inside `TicketNotifier::notify()` (`$recipient->id === $actor->id`).
+- `mb_strimwidth($message, 0, 80, '...')` builds the snippet, multibyte-safe for Bangla text.
+
+### 7.2 Operation: Download an attachment
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | Let authorized participants open uploaded files without any public URL. |
+| 2 | User roles | Anyone who can view the ticket; internal-note files: staff only. |
+| 3–5 | UI | Ticket details, file buttons from `tickets/_attachments.blade.php`. |
+| 8–9 | URL / route | `GET /tickets/{ticket}/attachments/{attachment}` · `tickets.attachments.download` |
+| 10 | Middleware | `auth`, `active` |
+| 11 | Controller | `TicketAttachmentController::download(Ticket $ticket, TicketAttachment $attachment)` |
+| 13 | Authorization | `Gate::authorize('downloadAttachment', [$ticket, $attachment])` (belongs to this ticket + can view + internal → staff) |
+| 14 | Business logic | Missing file → log + 404; else stream with the original name. |
+| 16 | SQL | `SELECT * FROM tickets WHERE id = 41`; `SELECT * FROM ticket_attachments WHERE id = 12`; (internal check) `SELECT * FROM ticket_comments WHERE id = 88` |
+| 21 | Response | `$disk->download($attachment->storage_path, $attachment->original_name, ['Content-Type' => $attachment->mime_type, 'X-Content-Type-Options' => 'nosniff'])` |
+| 23 | Errors | 403 (not allowed / wrong ticket in URL / customer on an internal file), 404 (missing file). |
+| 24 | Files | `TicketAttachmentController.php`, `TicketPolicy.php`, tests `InternalNotesAndAttachmentsTest` (`test_participant_can_download_and_others_cannot`, `test_internal_note_attachment_is_staff_only`, `test_attachment_of_another_ticket_cannot_be_downloaded_through_this_ticket`) |
+| 25 | Modifications | Inline preview for images: use `$disk->response(...)` only for safe image MIME types (keep `nosniff`). |
+
+`Gate::authorize('downloadAttachment', [$ticket, $attachment])` — the array passes **two** extra arguments to the
+policy method `downloadAttachment(User $user, Ticket $ticket, TicketAttachment $attachment)`. Laravel picks
+`TicketPolicy` from the first argument's class.
+
+> **বাংলায়:** File গুলো `storage/app/private`-এ থাকে, তাই সরাসরি URL দিয়ে খোলা যায় না। প্রতিটা download controller
+> দিয়ে যায়, যেখানে policy দেখে: file-টা কি এই টিকিটের, user কি টিকিট দেখতে পারে, আর internal note-এর file হলে
+> user কি staff।
 
 ---
 
 ## 8. Activity history
 
-Files: `app/Models/TicketActivity.php`, `TicketService::recordActivity()`, `tickets/show.blade.php` (Activity History card).
+Files: `app/Models/TicketActivity.php` (V2 static `record()`, `scopeVisibleTo()`, `isSystem()`),
+`tickets/show.blade.php` (Activity History card).
 
 ### 8.1 Operation: Record and display the audit trail
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Who did what and when, with old and new values. |
-| 2 | User roles | Written by every action; read by anyone who can view the ticket. |
-| 3 | UI page | Ticket details → Activity History. |
-| 4 | UI actions | Read only. |
-| 5 | Blade | `tickets/show.blade.php` (`<ul class="timeline">`) |
-| 6–7 | Click / data | Written automatically by `TicketService`; no form. |
-| 8–9 | URL / route | Displayed on `GET /tickets/{ticket}` (`tickets.show`). |
-| 10 | Middleware | `auth`, `active` |
-| 11 | Controller | `TicketController::show()` loads `'activities.user'`. |
-| 12 | Validation | — |
-| 13 | Authorization | `TicketPolicy::view()` |
-| 14 | Business logic | Actions written: `created`, `updated`, `assigned`, `reassigned`, `priority_changed`, `due_date_changed`, `status_changed`, `resolved`, `reopened`, `closed`. |
-| 15 | Eloquent | `TicketActivity::create([...])` (mass assignment through `$fillable`) |
-| 16 | SQL | `INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, updated_at, created_at) VALUES (7, 5, 'status_changed', 'Assigned', 'In Progress', NOW(), NOW());` · display: `SELECT * FROM ticket_activities WHERE ticket_id IN (7) ORDER BY created_at ASC, id ASC;` |
-| 17 | DB changes | One row per event, always inside the same transaction as the change it describes. |
-| 18–20 | — | — |
-| 21 | Response | Part of the details page. |
-| 22 | Blade | User name + lower-cased label + "old → new" (old value struck through) + date. |
-| 23 | Errors | If the activity insert fails, the whole transaction (including the ticket change) is rolled back — no change without history. |
-| 24 | Files | `TicketActivity.php`, `TicketService.php`, `tickets/show.blade.php` |
-| 25 | Modifications | Record comments in the timeline: call `recordActivity($lockedTicket, $author, 'commented', null, ...)` in `addComment()` and add `'commented' => '...'` to `ACTION_LABELS`. |
+| 1 | Business purpose | Who did what and when, with old and new values; system actions distinguishable; internal entries hidden from customers. |
+| 2 | User roles | Written by every action (and the scheduler); read by anyone who can view the ticket (customers: non-internal only). |
+| 3–5 | UI | Ticket details → Activity History (`<ul class="timeline">`). |
+| 6–9 | Click / URL | Written automatically; displayed on `GET /tickets/{ticket}`. |
+| 11 | Controller | `TicketController::show()` loads `'activities' => fn ($query) => $query->visibleTo($user)->with('user')`. |
+| 13 | Authorization | `TicketPolicy::view()` + `TicketActivity::scopeVisibleTo()` (`is_internal = 0` for customers). |
+| 14 | Business logic | Actions: `created`, `updated`, `assigned`, `reassigned`, `priority_changed`, `due_date_changed`, `status_changed`, `resolved`, `reopened`, `closed`, V2 `comment_added`, `internal_note_added`, `attachment_added`, `sla_breached`. |
+| 15 | Eloquent | `TicketActivity::record($ticket, $user, $action, $old, $new, $isInternal)` → `self::create([...])` |
+| 16 | SQL | `INSERT INTO ticket_activities (ticket_id, user_id, action, old_value, new_value, is_internal, ...) VALUES (43, NULL, 'sla_breached', NULL, 'Deadline was 26 Nov 2026, 11:00 AM', 0, ...);` · display: `... WHERE ticket_id IN (43) [AND is_internal = 0] ORDER BY created_at, id;` |
+| 17 | DB changes | One row per event, inside the same transaction as the change it describes. |
+| 22 | Blade | "System" (CPU icon) when `isSystem()`, otherwise the user's name; lower-cased label; "internal" badge; old → new. |
+| 23 | Errors | If the activity insert fails, the whole transaction is rolled back — no change without history. |
+| 24 | Files | `TicketActivity.php`, `TicketService.php`, `TicketAssignmentService.php`, `tickets/show.blade.php` |
+| 25 | Modifications | New action: call `TicketActivity::record()` with a new name and add a label to `ACTION_LABELS`. |
 
 ```php
-private function recordActivity(Ticket $ticket, User $user, string $action, ?string $oldValue, ?string $newValue): void
+/**
+ * Inserts one audit-trail row. $user = null means "performed by the system".
+ * Called inside the same transaction as the ticket change it describes.
+ */
+public static function record(Ticket $ticket, ?User $user, string $action, ?string $oldValue, ?string $newValue, bool $isInternal = false): self
 {
-    TicketActivity::create([
+    return self::create([
         'ticket_id' => $ticket->id,
-        'user_id' => $user->id,
+        'user_id' => $user?->id,
         'action' => $action,
         'old_value' => $oldValue,
         'new_value' => $newValue,
+        'is_internal' => $isInternal,
     ]);
 }
 ```
 
-`?string` = text or `null` (e.g. `created` has no old value). Values are stored as **readable text** ("Open",
-"Sarah Ahmed") instead of ids, so the history stays correct even if a name changes later.
+- `?User $user` + `$user?->id`: nullable type and nullsafe operator — `null` user → `user_id = NULL` (system).
+- `bool $isInternal = false`: a default parameter value, so most callers omit it.
+- It moved from a private `TicketService::recordActivity()` to the model in V2 because two services
+  (`TicketService`, `TicketAssignmentService`) need it.
 
-`TicketActivity::actionLabel()`:
-
-```php
-public function actionLabel(): string
-{
-    return self::ACTION_LABELS[$this->action] ?? $this->action;
-}
-```
-
-`??` falls back to the raw action name if a label is missing.
-
-Blade:
+Blade (V2 part):
 
 ```blade
-@foreach ($ticket->activities as $activity)
-    <li class="timeline-item">
-        <div>
-            <span class="fw-semibold">{{ $activity->user->name }}</span>
-            <span class="text-muted">{{ strtolower($activity->actionLabel()) }}</span>
-        </div>
-        @if ($activity->old_value !== null || $activity->new_value !== null)
-            <div class="small text-prewrap">
-                @if ($activity->old_value !== null)
-                    <span class="text-muted text-decoration-line-through">{{ $activity->old_value }}</span>
-                    <i class="bi bi-arrow-right mx-1 text-muted"></i>
-                @endif
-                <span>{{ $activity->new_value }}</span>
-            </div>
-        @endif
-        <div class="small text-muted">{{ $activity->created_at->format('d M Y, h:i A') }}</div>
-    </li>
-@endforeach
+@if ($activity->isSystem())
+    <span class="fw-semibold"><i class="bi bi-cpu"></i> System</span>
+@else
+    <span class="fw-semibold">{{ $activity->user->name }}</span>
+@endif
+<span class="text-muted">{{ strtolower($activity->actionLabel()) }}</span>
+@if ($activity->is_internal)
+    <span class="badge bg-warning-subtle text-warning-emphasis">internal</span>
+@endif
 ```
 
-`$activity->user` does not cause N+1 because `show()` eager-loaded `'activities.user'`.
+`$activity->user` is eager-loaded; for system rows it is `null`, which is why `isSystem()` is checked first.
 
 ---
 
@@ -1753,7 +1802,7 @@ public function index(Request $request)
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Operations overview: totals per status, overdue, average resolution time, charts, agent workload, recent tickets. |
+| 1 | Business purpose | Operations overview: totals per status, overdue, average resolution time, charts, agent workload, recent tickets; V2: active projects/clients/agents, global vs project tickets, SLA compliance, tickets by project/client, recent activity. |
 | 2 | User roles | Admin. |
 | 3 | UI page | Operations Dashboard. |
 | 4 | UI actions | Stat tiles link to filtered ticket lists (e.g. `route('tickets.index', ['status' => 'open'])`, `['overdue' => 1]`). |
@@ -1769,8 +1818,8 @@ public function index(Request $request)
 | 16 | SQL | see below |
 | 17 | DB changes | Cache row written on a cache miss. |
 | 18–19 | Notification / Queue | — |
-| 20 | Cache | Key `dashboard:admin:stats` (constant `TicketService::DASHBOARD_CACHE_KEY`), TTL `ADMIN_STATS_TTL_SECONDS = 60`. Cleared by every ticket change and every category change. |
-| 21 | Response | `view('dashboard.admin', ['stats' => ..., 'overdueCount' => ..., 'recentTickets' => ..., 'agentWorkload' => ...])` |
+| 20 | Cache | Key `dashboard:admin:stats` (constant `TicketService::DASHBOARD_CACHE_KEY`), TTL `ADMIN_STATS_TTL_SECONDS = 60`. Cleared by every ticket change (incl. assignment and SLA reminders), category change and V2 project/client/user/association change. Overdue count, recent tickets, workload and recent activity are live. |
+| 21 | Response | `view('dashboard.admin', ['stats' => ..., 'overdueCount' => ..., 'recentTickets' => ..., 'agentWorkload' => ..., 'recentActivity' => ...])` |
 | 22 | Blade / JS | Tiles via `@include('dashboard._stat-card', [...])`; "Statistics generated at {{ $stats['generated_at'] }}" shows when the cached data was built; `@json($stats['trend'])` passes data to Chart.js (line, doughnut, bar charts). |
 | 23 | Errors | No tickets → zeros and "—" for average resolution. |
 | 24 | Files | `DashboardController.php`, `dashboard/admin.blade.php`, `tests/Feature/CacheTest.php` |
@@ -1845,6 +1894,32 @@ $agentWorkload = User::where('role', User::ROLE_AGENT)
 Three counted sub-queries on the same relationship, each with its own alias. `$query->overdue()` reuses the model
 scope inside the sub-query. Inactive agents are included (no `is_active` filter) so their old work is visible.
 
+V2 statistics inside `buildAdminStatistics()` (cached):
+
+```php
+// Global = no project. SELECT COUNT(*) FROM tickets WHERE project_id IS NULL
+$globalCount = Ticket::whereNull('project_id')->count();
+
+// Project code => tickets (GROUP BY project_id, joined to get the code).
+$projectCounts = Ticket::join('projects', 'projects.id', '=', 'tickets.project_id')
+    ->select('projects.code', DB::raw('COUNT(*) AS total'))
+    ->groupBy('projects.code')
+    ->orderByDesc('total')
+    ->pluck('total', 'code')
+    ->map(fn ($total) => (int) $total)
+    ->toArray();
+...
+// SLA compliance depends only on resolved tickets (resolved_at vs due_at), so it is
+// safe to cache. The live "overdue" number is calculated outside the cache.
+$slaSummary = Ticket::slaSummary(Ticket::query());
+```
+
+- `join()` is an INNER JOIN: global tickets (`project_id NULL`) are not in `project_counts`; they are the
+  separate `global_count` card.
+- Charts `projectChart` and `clientChart` are drawn by the same inline Chart.js script (`simpleBarChart()`).
+- V2 recent activity (not cached): `TicketActivity::with(['user', 'ticket:id,ticket_number'])->latest('id')->take(10)->get()`
+  — `'ticket:id,ticket_number'` eager-loads only two columns. Admins see internal entries too.
+
 ### 9.2 Operation: Agent dashboard
 
 | # | Item | Detail |
@@ -1858,7 +1933,7 @@ scope inside the sub-query. Inactive agents are included (no `is_active` filter)
 | 10 | Middleware | `auth`, `active` |
 | 11 | Controller | `DashboardController::agentDashboard(User $agent)` |
 | 12–13 | Validation / Authorization | — / queries are limited to `assigned_to = agent id` |
-| 14 | Business logic | 5 counts (assigned total, pending = Assigned, in progress, resolved+closed, overdue), 8 recently updated, 5 most urgent overdue. |
+| 14 | Business logic | 5 counts (assigned total, pending = Assigned, in progress, resolved+closed, overdue), V2 workload = pending + in progress, 8 recently updated, 5 most urgent overdue, V2 8 recent activities on tickets the agent may see (`whereIn('ticket_id', Ticket::visibleTo($agent)->select('id'))`). |
 | 15 | Eloquent | `Ticket::where('assigned_to', $agent->id)->...->count()`, `Ticket::with(['category', 'creator'])->where(...)->latest('updated_at')->take(8)->get()`, `...->overdue()->orderBy('due_at')->take(5)->get()` |
 | 16 | SQL | e.g. `SELECT COUNT(*) FROM tickets WHERE assigned_to = 5 AND status = 'assigned';` · `SELECT * FROM tickets WHERE assigned_to = 5 AND status IN ('open','assigned','in_progress') AND due_at < NOW() ORDER BY due_at ASC LIMIT 5;` |
 | 17–19 | — | — |
@@ -1882,7 +1957,7 @@ scope inside the sub-query. Inactive agents are included (no `is_active` filter)
 | 10 | Middleware | `auth`, `active` |
 | 11 | Controller | `DashboardController::customerDashboard(User $customer)` |
 | 12–13 | Validation / Authorization | — / queries limited to `created_by = customer id` |
-| 14 | Business logic | Counts: total, active (`ACTIVE_STATUSES`), resolved (awaiting confirmation), closed; 8 most recently updated tickets. |
+| 14 | Business logic | Counts: total, active (`ACTIVE_STATUSES`), resolved (awaiting confirmation), closed, V2 overdue; 8 most recently updated tickets; V2 the customer's 5 latest notifications (`$customer->notifications()->latest()->take(5)->get()`). |
 | 15 | Eloquent | `Ticket::where('created_by', $customer->id)->whereIn('status', Ticket::ACTIVE_STATUSES)->count()`, `Ticket::with(['category', 'assignedAgent'])->where(...)->latest('updated_at')->take(8)->get()` |
 | 16 | SQL | `SELECT COUNT(*) FROM tickets WHERE created_by = 12 AND status IN ('open','assigned','in_progress');` · `SELECT * FROM tickets WHERE created_by = 12 ORDER BY updated_at DESC LIMIT 8;` |
 | 17–19 | — | — |
@@ -1901,64 +1976,87 @@ scope inside the sub-query. Inactive agents are included (no `is_active` filter)
 
 ## 10. Notifications
 
-Files: `app/Notifications/TicketNotification.php`, `TicketService::notifyUser()`,
+Files: `app/Notifications/TicketNotification.php`, V2 `app/Services/TicketNotifier.php`,
+`app/Events/UserNotificationCreated.php`, `routes/channels.php`, `resources/js/realtime.js`,
 `app/Http/Controllers/NotificationController.php`, `public/js/notifications.js`,
 `resources/views/partials/navbar.blade.php` (bell), `resources/views/notifications/index.blade.php`,
 `resources/views/layouts/app.blade.php` (toast container). Full guide: [13 — Notification system](13-NOTIFICATION-SYSTEM-GUIDE.md).
 
-Notification matrix (as implemented):
+Notification matrix (as implemented in V2):
 
-| Event | Recipient | In-app | Email |
+| Event (`event_type`) | Recipient | In-app | Email |
 |---|---|---|---|
 | Ticket created (`created`) | every active admin, except the creator | yes | yes |
 | Assigned (`assigned`) | new agent | yes | yes |
 | Reassigned (`reassigned`) | new agent | yes | yes |
-| Comment (`comment`) | creator + assigned agent, except author | yes | no |
+| V2 Unassigned (`unassigned`) | previous agent on reassignment | yes | no |
+| Public reply (`comment`) | creator + assigned agent, except author | yes | **only customer reply → assigned agent** |
+| V2 Internal note (`internal_note`) | assigned agent + creator if staff, except author | yes | no |
 | Resolved (`resolved`) | creator | yes | yes |
 | Reopened (`reopened`) | assigned agent | yes | yes |
 | Closed (`closed`) | assigned agent | yes | no |
+| V2 SLA breached (`sla_breached`) | assigned active agent, else every active admin | yes | yes |
 
-### 10.1 Operation: Create an in-app notification (`notifyUser`)
+Every in-app notification is also signalled in real time after commit (`notification.created` on
+`private-users.{id}`), with polling as fallback.
+
+### 10.1 Operation: Create an in-app notification (`TicketNotifier::notify`)
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Tell the right person about a ticket event. |
+| 1 | Business purpose | Tell the right person about a ticket event: durably (database), quickly (WebSocket) and optionally by email. |
 | 2 | User roles | Recipients per the matrix above. |
-| 3–7 | UI | Triggered by the workflow actions; no own form. |
-| 8–11 | URL / route / controller | Runs inside `TicketService` during the action's request. |
-| 12 | Validation | Recipient must exist, be active and not be the actor. |
-| 13 | Authorization | — (recipients are chosen by business rules). |
-| 14 | Business logic | Skip null/inactive/self; insert a database notification; optionally queue an email. |
-| 15 | Eloquent | `$recipient->notify(new TicketNotification($ticket, $eventType, $title, $message))` (from the `Notifiable` trait on `User`) |
-| 16 | SQL | `INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, read_at, created_at, updated_at) VALUES ('<uuid>', 'App\\Notifications\\TicketNotification', 'App\\Models\\User', 5, '{"ticket_id":7,...}', NULL, NOW(), NOW());` |
-| 17 | DB changes | 1 `notifications` row, inside the same transaction as the ticket change. |
+| 3–7 | UI | Triggered by the workflow actions and the SLA command; no own form. |
+| 8–11 | URL / route / controller | Runs inside `TicketService` / `TicketAssignmentService` during the action's request (or the scheduler). |
+| 12 | Validation | Recipient must exist, be active and not be the actor (`$actor = null` = system → nobody skipped). |
+| 13 | Authorization | — (recipients are chosen by business rules). The private channel is protected by `routes/channels.php`. |
+| 14 | Business logic | Skip null/inactive/self; insert a database notification with a known UUID; after commit broadcast the id; optionally queue an email after commit. |
+| 15 | Eloquent | `$recipient->notify($notification)` (from the `Notifiable` trait on `User`) |
+| 16 | SQL | `INSERT INTO notifications (id, type, notifiable_type, notifiable_id, data, read_at, created_at, updated_at) VALUES ('<uuid>', 'App\Notifications\TicketNotification', 'App\Models\User', 3, '{"ticket_id":42,...}', NULL, NOW(), NOW());` |
+| 17 | DB changes | 1 `notifications` row, inside the same transaction as the ticket change; after commit maybe 1 `jobs` row. |
 | 18 | Notification | This *is* the notification step. |
-| 19 | Queue | `queueEmail()` when `$sendEmail` is true. |
+| 19 | Queue | private `queueEmail()` when `$sendEmail` is true (after commit). Broadcast is `ShouldBroadcastNow` (not queued). |
 | 20 | Cache | — |
-| 21–22 | Response / JS | The recipient's browser finds it at the next poll. |
-| 23 | Errors | Exception → whole transaction rolled back (no ticket change without its notification). |
-| 24 | Files | `TicketService.php`, `TicketNotification.php`, `User.php` (`use HasFactory, Notifiable;`) |
-| 25 | Modifications | Add a new event: call `notifyUser(...)` with a new `$eventType`; nothing else is needed because the notification class is generic. |
+| 21–22 | Response / JS | The recipient's browser gets `notification.created` and fetches the feed (or finds it at the next poll). |
+| 23 | Errors | DB exception → whole transaction rolled back. Broadcast failure → `Log::warning(...)`, request still succeeds. Email dispatch failure → `Log::error('Could not queue ticket email', ...)`. |
+| 24 | Files | `TicketNotifier.php`, `TicketNotification.php`, `UserNotificationCreated.php`, `User.php`, tests `NotificationTest`, `RealtimeAndDeliveryTest` |
+| 25 | Modifications | New event: call `$this->notifier->notify(...)` with a new `$eventType`; the notification class is generic. |
 
 ```php
-private function notifyUser(?User $recipient, Ticket $ticket, User $actor, string $eventType, string $title, string $message, bool $sendEmail): void
+// app/Services/TicketNotifier.php
+public function notify(?User $recipient, Ticket $ticket, ?User $actor, string $eventType, string $title, string $message, bool $sendEmail): void
 {
     if ($recipient === null || ! $recipient->is_active) {
         return;
     }
 
-    if ($recipient->id === $actor->id) {
+    if ($actor !== null && $recipient->id === $actor->id) {
         return; // Do not notify people about their own actions.
     }
 
-    // Database notification: inserted inside the current transaction.
-    $recipient->notify(new TicketNotification($ticket, $eventType, $title, $message));
+    $notification = new TicketNotification($ticket, $eventType, $title, $message);
+    // We choose the UUID ourselves so we know which notifications.id row was created
+    // (Laravel keeps an id that is already set).
+    $notification->id = (string) Str::uuid();
+    $recipient->notify($notification);
+
+    $recipientId = $recipient->id;
+    $notificationId = $notification->id;
+    $this->afterCommit(function () use ($recipientId, $notificationId) {
+        $this->broadcast($recipientId, $notificationId);
+    });
 
     if ($sendEmail) {
-        $this->queueEmail($recipient, $ticket, $title, $message);
+        $this->queueEmail($recipient, $ticket, $title, $message, $notificationId);
     }
 }
 ```
+
+- `?User $actor`: `null` when the scheduler acts — the `$actor !== null` check prevents an error.
+- `afterCommit()` is a private wrapper around `DB::afterCommit()` that can **hold** side effects while
+  `TicketAssignmentService` holds its cache lock (`holdSideEffects()` / `releaseSideEffects()`).
+- `notifyAdmins()` loops over `User::where('role', User::ROLE_ADMIN)->where('is_active', true)->get()` and calls
+  `notify()` for each.
 
 `TicketNotification` — one reusable class for every event:
 
@@ -1992,15 +2090,14 @@ class TicketNotification extends Notification
 }
 ```
 
-- Constructor property promotion with **public** properties; the trailing comma after the last parameter is allowed in PHP 8.
 - `via()` returns `['database']` → Laravel's database channel calls `toArray()` and JSON-encodes the result into
   `notifications.data`.
 - The class does **not** implement `ShouldQueue`, so the row is inserted immediately — in-app notifications work
-  even when no queue worker is running.
+  even when no queue worker and no Reverb server are running.
 
-> **বাংলায়:** Laravel-এর `notifications` টেবিল একটি polymorphic টেবিল: `notifiable_type` (যেমন `App\Models\User`) আর
-> `notifiable_id` মিলে বলে notification-টি কার। `$user->notify(...)` একটি row insert করে, আর `data` column-এ JSON আকারে
-> টিকিট নম্বর, শিরোনাম, বার্তা রাখে। এটি queue ছাড়াই সরাসরি insert হয়, তাই worker না চললেও bell-এ notification আসে।
+> **বাংলায়:** V2-তে notification তিন ধাপে যায়: (১) database-এ row (transaction-এর ভেতরে, এটাই আসল রেকর্ড),
+> (২) commit-এর পরে WebSocket-এ শুধু id পাঠানো, (৩) দরকার হলে commit-এর পরে email job। Reverb বা queue বন্ধ থাকলেও
+> database notification থেকে যায়, তাই polling দিয়ে ব্যবহারকারী সেটা দেখতে পায়।
 
 ### 10.2 Operation: Polling feed (JSON) + toasts
 
@@ -2009,13 +2106,13 @@ class TicketNotification extends Notification
 | 1 | Business purpose | Near-real-time bell badge, dropdown and toasts without reloading the page. |
 | 2 | User roles | Every logged-in user. |
 | 3 | UI page | Every page using `layouts/app.blade.php`. |
-| 4 | UI actions | None — automatic every 5 s (30 s when the tab is hidden; immediately when the tab becomes visible again). |
+| 4 | UI actions | None — on page load, after each V2 real-time signal (`resolvedesk:realtime-notification` from `resources/js/realtime.js`), and every 5 s (30 s when hidden) **only while the WebSocket is not healthy**; immediately when the tab becomes visible again. |
 | 5 | Blade | `partials/navbar.blade.php`: `<div class="dropdown" id="notificationBell" data-feed-url="{{ route('notifications.feed') }}" ...>`; `#toast-container` in `layouts/app.blade.php`. |
 | 6 | On load | `notifications.js` calls `poll()` immediately, then schedules the next poll with `setTimeout` after each response. |
 | 7 | Data | Query string `since=<server_time of previous poll>` (ISO 8601). |
 | 8 | Method + URL | `GET /notifications/feed?since=2026-11-25T14:05:10%2B06:00` with `Accept: application/json` |
 | 9 | Route | `notifications.feed` |
-| 10 | Middleware | `auth`, `active` |
+| 10 | Middleware | `auth`, `active`, V2 `throttle:notifications` (120/min per user) |
 | 11 | Controller | `NotificationController::feed(Request $request)` |
 | 12 | Validation | `'since' => ['nullable', 'date']` → invalid value returns 422 instead of crashing. |
 | 13 | Authorization | Queries start from `$request->user()->notifications()` → only own rows. |
@@ -2175,20 +2272,20 @@ async function poll() {
 
 ## 11. Email and queue
 
-Files: `TicketService::queueEmail()`, `app/Jobs/SendTicketEmail.php`, `app/Mail/TicketUpdateMail.php`,
+Files: V2 `TicketNotifier::queueEmail()` (private), `app/Jobs/SendTicketEmail.php`, `app/Mail/TicketUpdateMail.php`,
 `resources/views/emails/ticket-update.blade.php`. Full guide: [14 — Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md).
 
 ### 11.1 Operation: Queue and send a ticket email
 
 | # | Item | Detail |
 |---|---|---|
-| 1 | Business purpose | Email important events (ticket created → admins, assigned, reassigned, resolved, reopened) without slowing the web request. |
+| 1 | Business purpose | Email important events (ticket created → admins, assigned, reassigned, resolved, reopened, V2 customer reply → agent, V2 SLA breach) without slowing the web request. |
 | 2 | User roles | Recipients per the notification matrix. |
 | 3–7 | UI | No own UI; triggered by workflow actions. |
-| 8–11 | URL / controller | Producer: the action's request (`TicketService::queueEmail`). Consumer: `php artisan queue:work` → `SendTicketEmail::handle()`. |
+| 8–11 | URL / controller | Producer: the action's request (or the scheduler) through `TicketNotifier::notify()` → `queueEmail()`. Consumer: `php artisan queue:work` → `SendTicketEmail::handle()`. |
 | 12 | Validation | — |
 | 13 | Authorization | The email link only opens the ticket after login + `TicketPolicy::view`. |
-| 14 | Business logic | Dispatch only **after COMMIT**; dispatch failure is logged, not shown to the user; 3 tries, 10 s backoff; `failed()` logs the final failure. |
+| 14 | Business logic | Dispatch only **after COMMIT**; dispatch failure is logged, not shown to the user; 3 tries, 10 s backoff, V2 60 s `$timeout` (shorter than `retry_after` 90 s); V2 `delivery_key` (= notification id) remembered in the cache for 2 days so a retried job skips an already-sent email; `failed()` logs the final failure. |
 | 15 | Eloquent | None in the job (it receives plain strings and an array). |
 | 16 | SQL | Producer: `INSERT INTO jobs (queue, payload, attempts, reserved_at, available_at, created_at) VALUES ('default', '{...}', 0, NULL, ..., ...);` Worker: reserves the row (`UPDATE jobs SET reserved_at = ?, attempts = attempts + 1 ...`), runs it, then `DELETE FROM jobs WHERE id = ?`. After the last failure: `INSERT INTO failed_jobs (uuid, connection, queue, payload, exception, failed_at) ...`. |
 | 17 | DB changes | `jobs` row (temporary), `failed_jobs` on permanent failure. |
@@ -2199,12 +2296,12 @@ Files: `TicketService::queueEmail()`, `app/Jobs/SendTicketEmail.php`, `app/Mail/
 | 22 | Output | `MAIL_MAILER=log` → the email HTML is written to `storage/logs/laravel.log`. |
 | 23 | Errors | Rollback → closure discarded, no job. Dispatch throws → `Log::error('Could not queue ticket email', ...)`. Send fails 3 times → `failed_jobs` + `Log::error('Ticket email failed permanently', ...)`. |
 | 24 | Files | `TicketService.php`, `SendTicketEmail.php`, `TicketUpdateMail.php`, `emails/ticket-update.blade.php`, `tests/Feature/QueueAndEmailTest.php` |
-| 25 | Modifications | Email on comments: pass `true` as the last `notifyUser()` argument in `addComment()`. Real SMTP: set `MAIL_MAILER=smtp` and the SMTP variables in `.env` (no code change). |
+| 25 | Modifications | Email for agent replies as well: change the `$sendEmail` condition in `TicketService::notifyCommentRecipients()`. Real SMTP: set `MAIL_MAILER=smtp` and the SMTP variables in `.env` (no code change). |
 
-#### `queueEmail()` block by block
+#### `queueEmail()` block by block (now in `TicketNotifier`)
 
 ```php
-private function queueEmail(User $recipient, Ticket $ticket, string $title, string $message): void
+private function queueEmail(User $recipient, Ticket $ticket, string $title, string $message, string $deliveryKey): void
 {
     $recipientEmail = $recipient->email;
     $recipientName = $recipient->name;
@@ -2213,22 +2310,25 @@ private function queueEmail(User $recipient, Ticket $ticket, string $title, stri
         'ticket_number' => $ticket->ticket_number,
         'subject' => $ticket->subject,
         'status' => $ticket->statusLabel(),
+        'project' => $ticket->project_id ? $ticket->project?->displayName() : null,
         'event_title' => $title,
         'event_message' => $message,
+        'delivery_key' => $deliveryKey, // = notification id; lets a retried job skip a sent email
     ];
 ```
 
 Plain values are copied **now**, inside the transaction, so the email shows the state at the moment of the event and
-the job payload stays small (no model serialization).
+the job payload stays small (no model serialization). V2 adds the project name (shown in the email for project
+tickets) and the `delivery_key`.
 
 ```php
-    DB::afterCommit(function () use ($recipientEmail, $recipientName, $emailData) {
+    $this->afterCommit(function () use ($recipientEmail, $recipientName, $emailData) {
         try {
             SendTicketEmail::dispatch($recipientEmail, $recipientName, $emailData);
         } catch (Throwable $exception) {
+            // The ticket change is already committed: log, do not fail the request.
             Log::error('Could not queue ticket email', [
-                'recipient' => $recipientEmail,
-                'ticket_number' => $emailData['ticket_number'],
+                'ticket_id' => $emailData['ticket_id'],
                 'error' => $exception->getMessage(),
             ]);
         }
@@ -2238,11 +2338,10 @@ the job payload stays small (no model serialization).
 
 | Part | Meaning |
 |---|---|
-| `DB::afterCommit(closure)` | Keep the closure until the current transaction **commits**. On rollback it is thrown away. |
+| `$this->afterCommit(closure)` | Private wrapper of `DB::afterCommit()`: keep the closure until the current transaction **commits** (discarded on rollback); while an assignment lock is held, the closure waits until the lock is released. |
 | `use (...)` | Copies the three variables into the closure (it runs later, after the method has returned). |
-| `SendTicketEmail::dispatch(...)` | Static helper from the `Queueable`/dispatchable trait: creates the job with these constructor arguments and pushes it to the queue (`jobs` table). |
-| `try / catch (Throwable $exception)` | If pushing fails (e.g. `jobs` table unavailable), the ticket change is already committed; showing an error would be misleading, so we only log it. |
-| `Log::error(message, context)` | Writes to `storage/logs/laravel.log` with the context array. |
+| `SendTicketEmail::dispatch(...)` | Creates the job with these constructor arguments and pushes it to the queue (`jobs` table). |
+| `try / catch (Throwable $exception)` | If pushing fails, the ticket change is already committed; showing an error would be misleading, so we only log it. |
 
 **Why after commit?** If the job were pushed inside the transaction and the transaction then rolled back, an email
 would describe a change that never happened. (With a fast worker, the job could even run before the commit and read
@@ -2265,6 +2364,9 @@ class SendTicketEmail implements ShouldQueue
     /** Wait 10 seconds before each retry. */
     public int $backoff = 10;
 
+    /** V2: kill the attempt after 60 seconds (must be shorter than retry_after = 90 s). */
+    public int $timeout = 60;
+
     public function __construct(
         public string $recipientEmail,
         public string $recipientName,
@@ -2275,9 +2377,22 @@ class SendTicketEmail implements ShouldQueue
     /** Runs inside the queue worker process, not during the web request. */
     public function handle(): void
     {
+        $deliveryKey = $this->emailData['delivery_key'] ?? null;
+        $cacheKey = $deliveryKey ? 'ticket-email-sent:' . $deliveryKey : null;
+
+        if ($cacheKey !== null && Cache::has($cacheKey)) {
+            Log::info('Ticket email already sent; skipping duplicate attempt', ['delivery_key' => $deliveryKey]);
+
+            return;
+        }
+
         Mail::to($this->recipientEmail)->send(
             new TicketUpdateMail($this->recipientName, $this->emailData)
         );
+
+        if ($cacheKey !== null) {
+            Cache::put($cacheKey, true, now()->addDays(2));
+        }
     }
 
     /** Called once after the final failed attempt (the job is then stored in failed_jobs). */
@@ -2351,10 +2466,13 @@ Files: `app/Models/Category.php`, `app/Http/Controllers/DashboardController.php`
 | Cache | Key | TTL | Built by | Cleared by |
 |---|---|---|---|---|
 | Active categories (dropdown) | `ticket:active-categories` (`Category::ACTIVE_CACHE_KEY`) | 3600 s (`ACTIVE_CACHE_TTL_SECONDS`) | `Category::activeForDropdown()` | `Category::clearActiveCache()` in `CategoryController::clearCaches()` (store, update, destroy) |
-| Admin statistics | `dashboard:admin:stats` (`TicketService::DASHBOARD_CACHE_KEY`) | 60 s (`DashboardController::ADMIN_STATS_TTL_SECONDS`) | `DashboardController::buildAdminStatistics()` | `TicketService::clearDashboardCache()` after create, update, assign, auto-assign, start, resolve, reopen, close; `CategoryController::clearCaches()` |
+| Admin statistics | `dashboard:admin:stats` (`TicketService::DASHBOARD_CACHE_KEY`) | 60 s (`DashboardController::ADMIN_STATS_TTL_SECONDS`) | `DashboardController::buildAdminStatistics()` | `TicketService::clearDashboardCache()` after create, update, start, resolve, reopen, close, V2 SLA reminder; V2 `TicketAssignmentService` after assign/auto-assign; `CategoryController::clearCaches()`; V2 `ProjectController`, `ClientController`, `ProjectService`, `UserController` |
+| V2 assignment lock | `ticket-assignment` (`config('resolvedesk.assignment_lock.key')`) | 10 s (lock, not data) | `Cache::lock()` in `TicketAssignmentService` | released after each assignment |
+| V2 email de-duplication | `ticket-email-sent:{notification id}` | 2 days | `SendTicketEmail::handle()` after a successful send | expires |
 
 **Not cached (on purpose):** overdue counts, ticket lists, ticket details, agent/customer dashboards,
-notifications, permissions. They must always be current.
+notifications, permissions, V2 agent eligibility and workload (used for assignment), reports. They must always
+be current.
 
 ### 12.1 Operation: Cache-aside read
 
@@ -2449,13 +2567,258 @@ fix them.
    > (`serializable_classes => false`)। তাই Eloquent Collection cache-এ রাখলে ফেরত আসত একটা "অসম্পূর্ণ"
    > object (`__PHP_Incomplete_Class`)। সমাধান: cache-এ শুধু সাধারণ array রাখি, পড়ার পর `hydrate()` দিয়ে
    > আবার model বানাই। Test-এ `array` store ছিল বলে bug ধরা পড়েনি — তাই এখন আসল `database` store দিয়ে একটা test আছে।
-2. **`TicketService::updateTicket()` does not lock the row** (`lockTicket()` is not used) and does not re-check the
-   policy inside the transaction. A customer editing at the same moment an admin assigns the ticket could still save
-   the edit. Low risk, but different from the other workflow methods.
-3. **`assigned_to` filter on the ticket list is not validated** (`TicketController::index`). It is safe (bound
-   parameter, admin only), but other filters are validated.
-4. **Reassignment notifies only the new agent**; the previous agent is not told the ticket was taken away.
-5. **Reopen keeps the original SLA deadline** (documented simplification in `TicketService::reopen`): a reopened
-   ticket may be overdue immediately.
-6. **Polling, not push**: notifications appear within ~5 seconds. WebSockets / Reverb / SSE are future improvements.
-7. **Comments are not written to the activity timeline** (not required by the spec).
+2. **FIXED in V2 — `updateTicket()` had no lock / version check.** It now uses one conditional
+   `UPDATE ... WHERE id = ? AND version = ? AND status <> 'closed'`; a stale form gets a conflict instead of a
+   lost update (`ConsistencyTest`).
+3. **FIXED in V2 — `assigned_to` filter was not validated.** It now has `regex:/^(unassigned|\d+)$/`, like the
+   new `project_id` / `client_id` filters.
+4. **FIXED in V2 — reassignment notified only the new agent.** The previous agent now gets an in-app
+   "Ticket reassigned to another agent" notification (ticket number only, because they lose access).
+5. **Reopen keeps the original SLA deadline** (documented rule, unchanged): a reopened ticket may be overdue
+   immediately; V2 resets `sla_notified_at` so it gets one fresh reminder.
+6. **CHANGED in V2 — real-time push.** Laravel Reverb + Echo deliver a signal within about a second; polling
+   remains as the fallback when the WebSocket is not healthy.
+7. **CHANGED in V2 — comments are in the timeline** (`comment_added`, `internal_note_added`, `attachment_added`).
+8. **V2 limitation — the assignment lock is global.** Only one assignment runs at a time (10 s expiry). Fine for
+   one support desk; a very large team would want per-project locks.
+9. **FIXED in the audit (A-3) — SLA reminders no longer bump `version`.** `processSlaBreach()` now uses a plain
+   `save()`: `sla_notified_at` is bookkeeping, so open pages/edit forms no longer get a false conflict.
+10. **V2 observation — the ticket list's project filter lists every project** (incl. inactive ones and other
+    clients' projects) for every role. The results are still limited by `visibleTo()`.
+11. **V2 observation — CSV order differs from the report page** (`chunkById()` orders by id ascending; the page
+    uses `latest()`). Same rows, different order.
+
+---
+
+## 14. Projects and client organizations (V2)
+
+Files: `app/Http/Controllers/ProjectController.php`, `app/Http/Controllers/ClientController.php`,
+`app/Services/ProjectService.php`, `app/Models/Project.php`, `app/Models/Client.php`,
+`resources/views/projects/*.blade.php`, `resources/views/clients/*.blade.php`, `partials/sla-stats.blade.php`,
+`partials/active-badge.blade.php`. All routes are inside `role:admin`; no `destroy` routes.
+Business rules: [22 — sections 2-4](22-V2-BUSINESS-FEATURES.md#2-projects-and-clients-crud-activation-no-delete).
+
+### 14.1 Operation: Create / edit / activate a project (or client)
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | Maintain the list of products (projects) and customer companies (clients). |
+| 2 | User roles | Admin. |
+| 3 | UI page | Projects / Clients → Create, Edit. |
+| 4 | UI actions | Fill code, name, description (clients: email, phone, address), Active switch → save. |
+| 5 | Blade | `projects/_form.blade.php` (+ `create`, `edit`); `clients/_form.blade.php` (+ `create`, `edit`) |
+| 7 | Form data | `code`, `name`, `description`, `is_active` (`1` or missing); clients also `email`, `phone`, `address`. |
+| 8 | Method + URL | `POST /projects`, `PUT /projects/{project}`; `POST /clients`, `PUT /clients/{client}` |
+| 9 | Route | `projects.store`, `projects.update`, `clients.store`, `clients.update` |
+| 10 | Middleware | `auth`, `active`, `role:admin` |
+| 11 | Controller | `ProjectController::store()` / `update()` → private `validateProject()`; `ClientController::store()` / `update()` → `validateClient()` |
+| 12 | Validation | `code` required max 30 `alpha_dash` `Rule::unique('projects', 'code')->ignore($project?->id)`; `name` max 150; `description` max 2000; `is_active` boolean; clients: `email` email, `phone` max 50, `address` max 500. |
+| 13 | Authorization | `role:admin` |
+| 14 | Business logic | `code` stored upper case; `is_active` from `$request->boolean()`. Deactivation always allowed (only new tickets are affected). |
+| 15 | Eloquent | `Project::create($validated)`, `$project->update($validated)` |
+| 16 | SQL | `SELECT COUNT(*) FROM projects WHERE code = 'HRMS' [AND id <> 1];` then `INSERT INTO projects (...)` / `UPDATE projects SET ... WHERE id = 1;` |
+| 17 | DB changes | One `projects` / `clients` row. |
+| 18–19 | Notification / Queue | — |
+| 20 | Cache | `Cache::forget(TicketService::DASHBOARD_CACHE_KEY)` (active project/client counts). |
+| 21 | Response | redirect to the details page: "Project HRMS was created." / "Project updated." / "Client ACME was created." / "Client updated." |
+| 23 | Errors | Duplicate code → "The code has already been taken." |
+| 24 | Files | Controllers + `_form` views, `tests/Feature/ProjectAndClientTest.php` |
+| 25 | Modifications | Add a "support email" to projects: migration + `$fillable` + rule + form input. |
+
+```php
+private function validateProject(Request $request, ?Project $project = null): array
+{
+    $validated = $request->validate([
+        'name' => ['required', 'string', 'max:150'],
+        // Unique code; when editing, ignore this project's own row.
+        'code' => ['required', 'string', 'max:30', 'alpha_dash', Rule::unique('projects', 'code')->ignore($project?->id)],
+        'description' => ['nullable', 'string', 'max:2000'],
+        'is_active' => ['boolean'],
+    ]);
+
+    $validated['code'] = strtoupper($validated['code']);
+    $validated['is_active'] = $request->boolean('is_active');
+
+    return $validated;
+}
+```
+
+`?Project $project = null` + `$project?->id`: on create there is no project, so `ignore(null)` ignores nothing.
+
+### 14.2 Operation: Project details page
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | One page for a product: SLA statistics, client checklist, agent checklist, latest tickets. |
+| 8–9 | URL / route | `GET /projects/{project}` · `projects.show` |
+| 11 | Controller | `ProjectController::show(Project $project)` |
+| 15 | Eloquent | `$project->load(['clients', 'agents'])`, `Ticket::with(['client', 'creator', 'assignedAgent'])->where('project_id', ...)->latest()->paginate(10)`, `Ticket::slaSummary(Ticket::where('project_id', $project->id))`, choices `Client::where('is_active', true)->orWhereIn('id', ...)` |
+| 22 | Blade | `partials/sla-stats.blade.php` (Total, Active, Overdue now, Resolved within SLA, Resolved after SLA, SLA compliance); two checkbox forms; tickets table. |
+
+```php
+// Choices for the association forms. Inactive records that are ALREADY
+// associated are still listed (checked) so saving does not remove them by accident.
+'clientChoices' => Client::where('is_active', true)
+    ->orWhereIn('id', $project->clients->pluck('id'))
+    ->orderBy('name')->get(),
+```
+
+The client details page (`ClientController::show()`) is similar: projects (read-only links), customers, tickets,
+`Ticket::slaSummary(Ticket::where('client_id', $client->id))`.
+
+### 14.3 Operation: Save the agents (or clients) of a project
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | Decide which agents are eligible for this product's tickets, and which clients use it. |
+| 2 | User roles | Admin. |
+| 3 | UI page | Project details. |
+| 4 | UI actions | Check/uncheck agents → **Save agents** (confirm); same for clients → **Save clients**. |
+| 5 | Blade | `projects/show.blade.php` (`#agents`, `#clients` cards; `@method('PUT')`; `old('agent_ids', ...)`) |
+| 7 | Form data | `agent_ids[]` (or `client_ids[]`) — the complete wanted list. |
+| 8 | Method + URL | `PUT /projects/{project}/agents` · `PUT /projects/{project}/clients` |
+| 9 | Route | `projects.agents.update` · `projects.clients.update` |
+| 10 | Middleware | `auth`, `active`, `role:admin` |
+| 11 | Controller | `ProjectController::updateAgents()` / `updateClients()` |
+| 12 | Validation | `agent_ids` array, `agent_ids.*` integer `exists:users,id` (clients: `exists:clients,id`). |
+| 13 | Authorization | `role:admin` |
+| 14 | Business logic | `ProjectService::syncAgents()` / `syncClients()`: lock project row → compute added/removed → added must be active (agents: role agent) → removal blocked while dependent tickets are open/reopenable → `sync()`. |
+| 15 | Eloquent | `Project::whereKey()->lockForUpdate()->firstOrFail()`, `$lockedProject->agents()->pluck('users.id')`, `User::whereIn(...)->count()`, `Ticket::where(...)->whereIn('status', Ticket::OPEN_OR_REOPENABLE_STATUSES)->count()`, `->agents()->sync($agentIds)` |
+| 16 | SQL | see [22 — 15.3](22-V2-BUSINESS-FEATURES.md#153-remove-an-agent-from-a-project-blocked-case) and the database guide §8.1.1 (`sync()`) |
+| 17 | DB changes | `project_user` / `client_project` rows inserted/deleted. |
+| 18–19 | Notification / Queue | — |
+| 20 | Cache | `clearCaches()` → forget the dashboard key after success. |
+| 21 | Response | `redirect()->to(route('projects.show', $project) . '#agents')->with('success', "Support agents updated ({$result['added']} added, {$result['removed']} removed).")` |
+| 23 | Errors | `Only active support agents can be added to a project.` · `{name} still has {N} unresolved or reopenable ticket(s) in this project. Reassign or close them before removing the agent.` (clients: `Only active clients can be added to a project.` · `... Close them before removing the client.`) |
+| 24 | Files | `ProjectController.php`, `ProjectService.php`, `projects/show.blade.php`, `tests/Feature/ProjectAndClientTest.php` |
+| 25 | Modifications | Also manage agent projects from the user page: add a form there that calls the same `ProjectService` methods (one rule set). |
+
+```php
+// app/Http/Controllers/ProjectController.php
+public function updateAgents(Request $request, Project $project)
+{
+    $validated = $request->validate([
+        'agent_ids' => ['array'],
+        'agent_ids.*' => ['integer', 'exists:users,id'],
+    ]);
+
+    $result = $this->projectService->syncAgents($project, $validated['agent_ids'] ?? []);
+
+    return redirect()->to(route('projects.show', $project) . '#agents')
+        ->with('success', "Support agents updated ({$result['added']} added, {$result['removed']} removed).");
+}
+```
+
+- `$validated['agent_ids'] ?? []`: unchecking every box sends no `agent_ids` key at all → empty list → remove all
+  (if allowed).
+- `array_map('intval', ...)` + `array_unique()` in the service normalize the submitted strings.
+
+> **বাংলায়:** Checkbox form পুরো তালিকা পাঠায়; service আগের তালিকার সাথে মিলিয়ে কে যোগ হলো আর কে বাদ গেল বের
+> করে। বাদ পড়া agent-এর এই project-এ খোলা বা reopen হতে পারে এমন টিকিট থাকলে পুরো কাজ বাতিল (rollback) হয়।
+
+---
+
+## 15. SLA breach reminders (V2)
+
+Files: `app/Console/Commands/CheckSlaBreaches.php`, `routes/console.php`, `TicketService::processSlaBreach()`.
+
+### 15.1 Operation: `php artisan tickets:check-sla` (scheduled)
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | One reminder per SLA breach: assigned agent, or admins for unassigned tickets. |
+| 2 | User roles | System (scheduler). |
+| 3–9 | UI / URL / route | None. `Schedule::command('tickets:check-sla')->everyMinute()->withoutOverlapping();` |
+| 10 | Middleware | None. `withoutOverlapping()` = cache lock around the command. |
+| 11 | Controller | `CheckSlaBreaches::handle(TicketService $ticketService)` (the service is injected by the container) |
+| 12 | Validation | Re-check on the locked row (still overdue, not yet notified). |
+| 14 | Business logic | `Ticket::overdue()->whereNull('sla_notified_at')->select('id')->chunkById(100, ...)` → `processSlaBreach()` per ticket; failures counted and reported, the loop continues. |
+| 16 | SQL | see [22 — 15.5](22-V2-BUSINESS-FEATURES.md#155-sla-breach-processing) |
+| 17 | DB changes | `tickets.sla_notified_at`, `version`; activity with `user_id NULL`; notifications; jobs. |
+| 18 | Notification | "SLA deadline breached" — "Ticket TK-000043 passed its SLA deadline (26 Nov 2026, 11:00 AM)." |
+| 19 | Queue | Email per recipient. |
+| 20 | Cache | Dashboard key cleared when a reminder was sent. |
+| 21 | Response | Console: "SLA check finished: N breach notification(s) sent, M failure(s)."; exit code `SUCCESS`/`FAILURE`. |
+| 24 | Files | `CheckSlaBreaches.php`, `TicketService.php`, `routes/console.php`, `tests/Feature/SlaReportsAndHardeningTest.php` |
+| 25 | Modifications | Frequency in `routes/console.php`; multi-server: add `->onOneServer()` with a shared cache. |
+
+```php
+Ticket::overdue()
+    ->whereNull('sla_notified_at')
+    ->select('id')
+    ->chunkById(100, function ($tickets) use ($ticketService, &$notifiedCount, &$failedCount) {
+        foreach ($tickets as $ticket) {
+            try {
+                if ($ticketService->processSlaBreach($ticket)) {
+                    $notifiedCount++;
+                }
+            } catch (Throwable $exception) {
+                // One broken ticket must not stop the others.
+                $failedCount++;
+                report($exception);
+            }
+        }
+    });
+```
+
+- `chunkById(100)` pages by `id > last_id` (safe while rows change, unlike `OFFSET`).
+- `select('id')`: the command needs only ids; `processSlaBreach()` re-reads the full row with a lock.
+- `use (..., &$notifiedCount)`: `&` passes the variable **by reference**, so the closure can increment the
+  counter outside it.
+- `report($exception)` logs the error without stopping the command.
+
+---
+
+## 16. Reports and CSV export (V2)
+
+Files: `app/Http/Controllers/ReportController.php`, `resources/views/reports/index.blade.php`,
+`TicketController::applyFilters()`, `Ticket::slaSummary()`. Rules and the full walkthrough:
+[22 — section 13 and 15.6](22-V2-BUSINESS-FEATURES.md#13-reports-and-csv-export).
+
+### 16.1 Operation: Report page
+
+| # | Item | Detail |
+|---|---|---|
+| 1 | Business purpose | Filtered ticket statistics (status breakdown, SLA compliance) for management. |
+| 2 | User roles | Admin. |
+| 4 | UI actions | Project (incl. Global), Client (incl. Internal), Agent (incl. Unassigned), Status, Priority, Category, From/To → **Filter**, **Reset**, **Export CSV**. |
+| 8–9 | URL / route | `GET /reports?...` · `reports.index` |
+| 10 | Middleware | `auth`, `active`, `role:admin` |
+| 11 | Controller | `ReportController::index()` → private `filteredQuery()` |
+| 12 | Validation | Same rules as the ticket list (in `filteredQuery()`). |
+| 15 | Eloquent | `(clone $query)->reorder()->selectRaw('status, COUNT(*) AS total')->groupBy('status')->pluck('total', 'status')`, `Ticket::slaSummary((clone $query)->reorder())`, `->with([...])->latest()->paginate(20)` |
+| 20 | Cache | Not cached (filters vary). |
+| 22 | Blade | `partials/sla-stats.blade.php` + table. |
+| 24 | Files | `ReportController.php`, `reports/index.blade.php`, `SlaReportsAndHardeningTest::test_report_page_shows_filtered_tickets_and_sla_compliance` |
+
+`clone $query`: query builders are objects; without `clone` the `groupBy` of the first statement would also
+change the query used for the table. `reorder()` removes any ORDER BY before aggregating.
+
+### 16.2 Operation: CSV export
+
+| # | Item | Detail |
+|---|---|---|
+| 8–9 | URL / route | `GET /reports/export?...same filters` · `reports.export` |
+| 10 | Middleware | `auth`, `active`, `role:admin`, `throttle:exports` (5/min) |
+| 11 | Controller | `ReportController::export(Request $request): StreamedResponse` |
+| 14 | Business logic | `response()->streamDownload(...)`: BOM, header row, `chunkById(500)` with eager loading, `safeCsvValue()` on every cell, `slaResult()` column. |
+| 21 | Response | `text/csv; charset=UTF-8`, file `resolvedesk-tickets-YYYYmmdd-HHiiss.csv` |
+| 23 | Errors | 429 on the 6th export per minute; invalid filters → redirect back. |
+| 24 | Files | `ReportController.php`, `SlaReportsAndHardeningTest::test_csv_export_respects_filters_and_blocks_formula_injection`, `test_csv_export_is_rate_limited` |
+| 25 | Modifications | New column: header array + row array (keep `safeCsvValue`). |
+
+```php
+public function safeCsvValue($value): string
+{
+    $value = (string) $value;
+
+    if ($value !== '' && in_array($value[0], ['=', '+', '-', '@', "\t", "\r"], true)) {
+        return "'" . $value;
+    }
+
+    return $value;
+}
+```
+
+`array_map([$this, 'safeCsvValue'], [...])` calls the method for every cell (`[$object, 'method']` is a PHP
+callable).

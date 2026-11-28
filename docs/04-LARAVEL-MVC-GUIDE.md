@@ -3,6 +3,10 @@
 This guide explains how Laravel works **inside this project**. Every file, class, method and route
 name below exists in the code. When a snippet is shown, it is copied from the file.
 
+**V2 note:** sections 1–22 explain the MVC basics (updated where V2 changed the code). Sections **23–27** add the V2
+Laravel features: Form Requests, events and broadcasting, Artisan commands and the scheduler, the V2 request
+lifecycle with `AddRequestContext` and `throttle`, and the service split.
+
 Related guides:
 [Database](03-DATABASE-GUIDE.md) ·
 [Module-wise code](05-MODULE-WISE-CODE-EXPLANATION.md) ·
@@ -11,7 +15,10 @@ Related guides:
 [Debugging](11-DEBUGGING-GUIDE.md) ·
 [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) ·
 [Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) ·
-[Caching](15-CACHING-GUIDE.md)
+[Caching](15-CACHING-GUIDE.md) ·
+[Concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md) ·
+[Real-time](21-REALTIME-REVERB-ECHO.md) ·
+[Security/logging](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md)
 
 ---
 
@@ -39,6 +46,11 @@ Related guides:
 20. [Authorization](#20-authorization)
 21. [CSRF protection](#21-csrf-protection)
 22. [Quick "where is it?" table](#22-quick-where-is-it-table)
+23. [V2: Form Request (`StoreTicketRequest`)](#23-v2-form-request-storeticketrequest)
+24. [V2: Events and broadcasting](#24-v2-events-and-broadcasting)
+25. [V2: Artisan command and the scheduler](#25-v2-artisan-command-and-the-scheduler)
+26. [V2: Request lifecycle with `AddRequestContext` and `throttle`](#26-v2-request-lifecycle-with-addrequestcontext-and-throttle)
+27. [V2: Services, exceptions and config used by controllers](#27-v2-services-exceptions-and-config-used-by-controllers)
 
 ---
 
@@ -56,10 +68,14 @@ MVC means **Model – View – Controller**. Each part has one job.
 | Policy | "Can this user do this action on this ticket?" | `app/Policies/TicketPolicy.php` |
 | Service | Ticket business rules that touch several tables | `app/Services/TicketService.php` |
 
-ResolveDesk adds **one service class** (`TicketService`) to classic MVC. Reason: a ticket action such as
+V1 added **one service class** (`TicketService`) to classic MVC. Reason: a ticket action such as
 "resolve" changes the ticket, writes an activity row, creates a notification, queues an email and clears a
 cache. Putting all of that in the controller would make the controller very long. Simple CRUD
-(users, categories) stays in the controllers.
+(users, categories, clients) stays in the controllers.
+
+**V2** split the rules into five small services, each with one reason to change: `TicketService` (create, edit,
+transitions, comments, SLA), `TicketAssignmentService` (assignment + locks), `TicketNotifier` (database notification,
+after-commit broadcast and email), `AttachmentService` (private files) and `ProjectService` (association changes).
 
 ```mermaid
 flowchart LR
@@ -130,8 +146,9 @@ Line by line:
 ```php
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(
-        web: __DIR__.'/../routes/web.php',
-        commands: __DIR__.'/../routes/console.php',
+        web: __DIR__ . '/../routes/web.php',
+        commands: __DIR__ . '/../routes/console.php',
+        channels: __DIR__ . '/../routes/channels.php',   // V2: private broadcast channels
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
@@ -144,6 +161,9 @@ return Application::configure(basePath: dirname(__DIR__))
         // Where the "auth" middleware sends guests, and where "guest" sends logged-in users.
         $middleware->redirectGuestsTo('/login');
         $middleware->redirectUsersTo('/dashboard');
+
+        // V2: request id + user id in every log line (runs after the session has started).
+        $middleware->web(append: [AddRequestContext::class]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //
@@ -167,7 +187,9 @@ return Application::configure(basePath: dirname(__DIR__))
 | Part | Meaning in ResolveDesk |
 |---|---|
 | `web: .../routes/web.php` | Loads all browser routes and wraps them in the **`web` middleware group** (cookies, session, CSRF, route model binding). |
-| `commands: .../routes/console.php` | Artisan console commands file. |
+| `commands: .../routes/console.php` | Artisan console commands file. **V2:** also holds the schedule (`Schedule::command('tickets:check-sla')`). |
+| `channels: .../routes/channels.php` | **V2:** registers the private channel rules and the `POST /broadcasting/auth` route. |
+| `$middleware->web(append: [AddRequestContext::class])` | **V2:** adds our middleware to the **end** of the `web` group, so it runs after `StartSession` (the user is known) — see section 26. |
 | `health: '/up'` | Laravel's built-in health check URL (returns 200 if the app boots). |
 | `$middleware->alias([...])` | Gives short names to our two custom middleware so `routes/web.php` can write `'active'` and `'role:admin'`. |
 | `redirectGuestsTo('/login')` | When the built-in `auth` middleware finds no logged-in user, it redirects to `/login` (for normal page requests). |
@@ -467,7 +489,9 @@ request on with `$next($request)` or stops it by returning a response (redirect,
 | `guest` | `Illuminate\Auth\Middleware\RedirectIfAuthenticated` | `/login` routes | Logged-in user → redirect to `/dashboard` (`redirectUsersTo`) |
 | `auth` | `Illuminate\Auth\Middleware\Authenticate` | All protected routes | Guest → redirect `/login` (`redirectGuestsTo`), or 401 JSON for AJAX |
 | `active` | `App\Http\Middleware\ActiveUserMiddleware` | All protected routes | Logs out a user deactivated while logged in |
-| `role:admin` | `App\Http\Middleware\RoleMiddleware` | Users, categories, assign, auto-assign | 403 for non-admins |
+| `role:admin` | `App\Http\Middleware\RoleMiddleware` | Users, categories, projects, clients, reports, assign, auto-assign | 403 for non-admins |
+| `AddRequestContext` (V2) | `App\Http\Middleware\AddRequestContext` | Appended to the `web` group (every web route) | Request id in logs + `X-Request-Id` header |
+| `throttle:NAME` (V2) | `Illuminate\Routing\Middleware\ThrottleRequests` | `tickets.store`, `tickets.comments.store`, `notifications.feed`, `reports.export`, `health.ready` | 429 when a named rate limit is exceeded |
 
 Note: in Laravel 13 the CSRF middleware class in the `web` group is
 `Illuminate\Foundation\Http\Middleware\PreventRequestForgery` (older versions called it `VerifyCsrfToken`).
@@ -616,9 +640,9 @@ Global middleware also cleans input: `TrimStrings` removes spaces at both ends, 
 `ConvertEmptyStringsToNull` turns `""` into `null`. That is why an empty password field on the user edit form
 arrives as `null` and passes the `nullable` rule.
 
-This project does **not** use separate Form Request classes (`php artisan make:request`). Validation is written
-inline in the controller so each action can be read in one place. A Form Request would be the next step if the
-rules grew larger.
+V1 used only inline validation. **V2 added one Form Request**, `App\Http\Requests\StoreTicketRequest`, for ticket
+creation, because its rules grew (project, client, idempotency token, attachments). All other actions still validate
+inline so each action can be read in one place. See section 23.
 
 ---
 
@@ -626,7 +650,8 @@ rules grew larger.
 
 ### 10.1 Inline `$request->validate()`
 
-`TicketController::store()`:
+V1 `TicketController::store()` (in V2 these rules moved into `StoreTicketRequest::rules()`, section 23; the same
+inline style is still used by `update()`, `assign()`, `resolve()`, `TicketCommentController::store()` and others):
 
 ```php
 $validated = $request->validate([
@@ -1122,13 +1147,10 @@ page. Pressing F5 then reloads the GET page instead of re-submitting the form.
 ```php
 class TicketController extends Controller
 {
-    /**
-     * Laravel's service container creates TicketService automatically and
-     * passes it in here (constructor dependency injection).
-     */
-    public function __construct(private TicketService $ticketService)
-    {
-    }
+    public function __construct(
+        private TicketService $ticketService,
+        private TicketAssignmentService $assignmentService,   // V2
+    ) {}
 ```
 
 - `private TicketService $ticketService` inside the constructor parameters is **constructor property promotion**
@@ -1145,7 +1167,8 @@ class TicketController extends Controller
 
 - We never write `new TicketService()`. When the router needs a `TicketController`, it asks the **service
   container**. The container reads the constructor's type hint (`TicketService`), creates that object (and its own
-  dependencies, recursively — TicketService has none), and passes it in. This is called **auto-wiring**
+  dependencies, recursively — in V2 `TicketService` itself needs `TicketNotifier` and `AttachmentService`, and
+  `TicketAssignmentService` needs `TicketNotifier`), and passes it in. This is called **auto-wiring**
   (it uses PHP reflection).
 - `TicketCommentController` uses exactly the same constructor.
 
@@ -1523,10 +1546,268 @@ POST **without** a token (curl, which sends no `Sec-Fetch-Site` header) returned
 | Where are all URLs? | `routes/web.php` (`php artisan route:list --except-vendor`) |
 | Who may open admin pages? | `role:admin` → `app/Http/Middleware/RoleMiddleware.php` |
 | Who may do X to a ticket? | `app/Policies/TicketPolicy.php` |
-| Where are ticket business rules? | `app/Services/TicketService.php` |
+| Where are ticket business rules? | `app/Services/TicketService.php` (V2: assignment in `TicketAssignmentService`, delivery in `TicketNotifier`, files in `AttachmentService`, associations in `ProjectService`) |
+| Where is create-ticket validation? (V2) | `app/Http/Requests/StoreTicketRequest.php` |
+| Where are rate limits? (V2) | `AppServiceProvider::configureRateLimiting()` |
+| Where are broadcast channel rules? (V2) | `routes/channels.php` |
+| Where is the schedule? (V2) | `routes/console.php` |
+| Where are business settings? (V2) | `config/resolvedesk.php` |
 | Where are statuses/priorities/SLA? | `app/Models/Ticket.php` constants |
 | Where is the main HTML layout? | `resources/views/layouts/app.blade.php` |
 | Where are success/error messages shown? | `resources/views/partials/flash.blade.php` |
 | Where is the JSON endpoint? | `NotificationController::feed()` → `GET /notifications/feed` |
 | Where is pagination styled? | `AppServiceProvider::boot()` → `Paginator::useBootstrapFive()` |
 | Where is N+1 protection? | `AppServiceProvider::boot()` → `Model::preventLazyLoading(...)` |
+
+---
+
+## 23. V2: Form Request (`StoreTicketRequest`)
+
+A **Form Request** is a class that holds the authorization and validation for one request. Laravel resolves it
+**before** the controller method runs.
+
+```php
+// app/Http/Controllers/TicketController.php
+public function store(StoreTicketRequest $request)
+{
+    // StoreTicketRequest already authorized and validated the input.
+    $ticket = $this->ticketService->createTicket(
+        $request->safe()->except('attachments'),
+        $request->user(),
+        $request->file('attachments', [])
+    );
+    ...
+}
+```
+
+```php
+// app/Http/Requests/StoreTicketRequest.php (shortened)
+class StoreTicketRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        // Same as Gate::authorize('create', Ticket::class) -> TicketPolicy::create().
+        return $this->user()->can('create', Ticket::class);
+    }
+
+    public function rules(): array
+    {
+        return array_merge([
+            'subject' => ['required', 'string', 'max:255'],
+            'description' => ['required', 'string', 'max:5000'],
+            'category_id' => ['required', 'integer', Rule::exists('categories', 'id')->where('is_active', true)],
+            'priority' => ['required', Rule::in(array_keys(Ticket::PRIORITIES))],
+            'project_id' => ['nullable', 'integer', 'exists:projects,id'],
+            'client_id' => ['nullable', 'integer', 'exists:clients,id'],
+            'request_token' => ['required', 'string', 'uuid'],   // idempotency key (hidden field)
+        ], AttachmentService::validationRules());
+    }
+
+    public function messages(): array { /* custom texts, e.g. 'The form expired. Please reload...' */ }
+}
+```
+
+How Laravel processes it:
+
+1. The router sees the type hint `StoreTicketRequest` and asks the container for it.
+2. The container fills it with the current request data, then calls `authorize()`. `false` → **403**.
+3. It runs `rules()` (+ `messages()`). Failure → `ValidationException` → redirect back with `$errors` and `old()`
+   (or **422** JSON).
+4. Only then is `store()` called. `$request->safe()` returns only the validated fields, so an injected `status` or
+   `created_by` field can never reach the service.
+
+Format vs business rules: the Form Request checks **format** ("is `project_id` an existing id?"). Whether **this
+user** may use **this project/client** is decided by `TicketService::resolveScope()` inside the transaction, together
+with a shared lock on the project row — that cannot be done safely in a Form Request.
+
+> **বাংলায়:** Form Request হলো validation আর authorization-এর আলাদা একটা ক্লাস। Controller method চলার আগেই Laravel
+> এটা চালায় — অনুমতি না থাকলে 403, ইনপুট ভুল হলে ফর্মে ফেরত। ফলে controller ছোট আর পরিষ্কার থাকে। কিন্তু "এই ইউজার কি
+> এই প্রজেক্টে টিকিট খুলতে পারবে" — এমন ব্যবসায়িক নিয়ম service-এ থাকে, কারণ সেটা লক করা ডাটা দেখে যাচাই করতে হয়।
+
+Create one with `php artisan make:request StoreSomethingRequest`.
+
+## 24. V2: Events and broadcasting
+
+An **event** is a class that says "something happened". It can have listeners, or — as here — be **broadcast** to a
+WebSocket server.
+
+```php
+// app/Events/UserNotificationCreated.php
+class UserNotificationCreated implements ShouldBroadcastNow
+{
+    use Dispatchable;
+
+    public function __construct(public int $userId, public string $notificationId) {}
+
+    public function broadcastOn(): array
+    {
+        return [new PrivateChannel('users.' . $this->userId)];   // channel "private-users.7"
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'notification.created';                           // JS listens to ".notification.created"
+    }
+
+    public function broadcastWith(): array
+    {
+        return ['notification_id' => $this->notificationId];     // the ONLY data sent
+    }
+}
+```
+
+| Piece | Where | Meaning |
+|---|---|---|
+| `ShouldBroadcastNow` | the event | Send to Reverb during the request (not via the queue). `ShouldBroadcast` would push a queued job instead. |
+| `event(new UserNotificationCreated(...))` | `TicketNotifier::broadcast()` | Fires the event; Laravel's broadcaster (`BROADCAST_CONNECTION=reverb`) sends an HTTP request to Reverb, which pushes it to subscribed sockets. |
+| `DB::afterCommit(...)` | `TicketNotifier::afterCommit()` | The event is fired only **after** the transaction commits (never for a rolled-back change). |
+| try/catch | `TicketNotifier::broadcast()` | Reverb down → warning in the log, request still succeeds. |
+| `Broadcast::channel('users.{userId}', ...)` | `routes/channels.php` | Authorization for private channels; called by `POST /broadcasting/auth`. |
+| Echo | `resources/js/realtime.js` | Browser client: `echo.private('users.' + id).listen('.notification.created', ...)`. |
+
+Why a separate `TicketNotification` (database) **and** an event? The notification row is the durable record (history
+page, unread count, polling). The event is only a fast "go fetch" signal. Tests use `Event::fake([UserNotificationCreated::class])`
+and `BROADCAST_CONNECTION=null` (`phpunit.xml`).
+
+Details: [21-REALTIME-REVERB-ECHO.md](21-REALTIME-REVERB-ECHO.md), [13-NOTIFICATION-SYSTEM-GUIDE.md](13-NOTIFICATION-SYSTEM-GUIDE.md).
+
+> **বাংলায়:** Event মানে "একটা ঘটনা ঘটেছে" — যেমন "ইউজার ৭-এর নতুন নোটিফিকেশন এসেছে"। Broadcast করলে এই খবরটা
+> WebSocket দিয়ে সরাসরি ঐ ইউজারের ব্রাউজারে চলে যায়। আমরা শুধু notification-এর id পাঠাই; আসল লেখা ব্রাউজার আলাদা
+> অনুমোদিত রিকোয়েস্টে আনে।
+
+## 25. V2: Artisan command and the scheduler
+
+An **Artisan command** is a class you run from the terminal. The **scheduler** runs commands on a timetable.
+
+```php
+// app/Console/Commands/CheckSlaBreaches.php (shortened)
+class CheckSlaBreaches extends Command
+{
+    protected $signature = 'tickets:check-sla';           // php artisan tickets:check-sla
+    protected $description = 'Notify agents/admins about tickets that passed their SLA deadline (once per breach)';
+
+    public function handle(TicketService $ticketService): int   // method injection by the container
+    {
+        Ticket::overdue()->whereNull('sla_notified_at')->select('id')
+            ->chunkById(100, function ($tickets) use ($ticketService, ...) {
+                foreach ($tickets as $ticket) {
+                    try { $ticketService->processSlaBreach($ticket); } catch (Throwable $e) { report($e); }
+                }
+            });
+
+        $this->info("SLA check finished: ...");
+        return $failedCount === 0 ? self::SUCCESS : self::FAILURE;
+    }
+}
+```
+
+```php
+// routes/console.php
+Schedule::command('tickets:check-sla')
+    ->everyMinute()
+    ->withoutOverlapping();
+```
+
+| Concept | Meaning |
+|---|---|
+| Auto-discovery | Laravel 13 finds commands in `app/Console/Commands` automatically (no registration). |
+| `$signature` | Command name (and arguments/options if any). |
+| `handle()` | Runs the command; parameters are injected by the container. Return `self::SUCCESS` (0) or `self::FAILURE` (1). |
+| `chunkById(100, ...)` | Reads 100 rows at a time ordered by id → constant memory even with many tickets. |
+| `Schedule::command(...)->everyMinute()` | Defines **when**; the scheduler itself must be triggered. |
+| `withoutOverlapping()` | Skips a run if the previous one is still busy (cache lock). |
+| `php artisan schedule:work` | Local: runs the scheduler in the foreground, checks every minute. |
+| `* * * * * php artisan schedule:run` | Server: one cron entry; Laravel decides which tasks are due. |
+| `php artisan schedule:list` | Shows tasks and next run time. |
+
+The command contains no business logic itself: `TicketService::processSlaBreach()` locks the row, re-checks
+"overdue and not yet notified", sets `sla_notified_at`, records a **system** activity (`user_id = NULL`) and notifies.
+
+> **বাংলায়:** Scheduler হলো অ্যাপের ভেতরের অ্যালার্ম ঘড়ি। সার্ভারে শুধু একটা cron লাইন প্রতি মিনিটে
+> `schedule:run` চালায়; কোন কাজ কখন চলবে সেটা কোডে (`routes/console.php`) লেখা থাকে।
+
+## 26. V2: Request lifecycle with `AddRequestContext` and `throttle`
+
+Example: a customer submits **Create Ticket** (`POST /tickets`).
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant K as public/index.php + Kernel
+    participant W as web group
+    participant RC as AddRequestContext
+    participant A as auth + active
+    participant T as throttle:ticket-create
+    participant FR as StoreTicketRequest
+    participant C as TicketController::store
+    participant S as TicketService::createTicket
+    B->>K: POST /tickets (cookie, _token, request_token, files)
+    K->>W: EncryptCookies, StartSession, ShareErrors, CSRF check
+    W->>RC: request id + Log::withContext(request_id, user_id)
+    RC->>A: logged in? still active?
+    A->>T: under 10 per minute for this user?
+    T->>FR: authorize() + rules()
+    FR->>C: validated data
+    C->>S: createTicket(safe data, user, files)
+    S-->>C: Ticket (new or replay)
+    C-->>B: 302 to tickets.show + flash, header X-Request-Id
+```
+
+| # | Step | Code | Can stop the request with |
+|---|---|---|---|
+| 1 | Front controller, app boot, providers (`AppServiceProvider::boot()` registers rate limiters) | `public/index.php`, `bootstrap/app.php` | 500 |
+| 2 | `web` group: cookies, session, `$errors`, CSRF | framework | 419 |
+| 3 | `AddRequestContext` (appended to `web`) | `app/Http/Middleware/AddRequestContext.php` | — (adds header on the way out) |
+| 4 | `auth`, `active` (route group) | `ActiveUserMiddleware` | redirect to login |
+| 5 | `role:admin` (admin routes only) | `RoleMiddleware` | 403 |
+| 6 | `throttle:ticket-create` (route) | `RateLimiter::for('ticket-create', ...)` | 429 |
+| 7 | Route model binding (`{ticket}` routes) | `SubstituteBindings` | 404 |
+| 8 | Form Request `authorize()` / `rules()` or `Gate::authorize()` + `$request->validate()` in the controller | `StoreTicketRequest`, `TicketPolicy` | 403 / 302 back / 422 |
+| 9 | Service: transaction, locks, version check | `TicketService`, `TicketAssignmentService` | 302 back with error, 409 (JSON) via `TicketConflictException` |
+| 10 | After commit: broadcast + email job; cache cleared | `TicketNotifier` | never fails the request |
+| 11 | Response + `X-Request-Id` header; session saved | — | — |
+
+`AddRequestContext` in short:
+
+```php
+$incomingId = (string) $request->headers->get('X-Request-Id', '');
+$requestId = preg_match('/^[A-Za-z0-9\-]{8,64}$/', $incomingId) ? $incomingId : (string) Str::uuid();
+
+Log::withContext(['request_id' => $requestId, 'user_id' => $request->user()?->id]);
+
+$response = $next($request);
+$response->headers->set('X-Request-Id', $requestId);
+return $response;
+```
+
+Code **before** `$next()` runs on the way in, code **after** it on the way out — this middleware does both.
+
+Rate limiters (`AppServiceProvider::configureRateLimiting()`):
+
+```php
+$byUserOrIp = fn (Request $request) => $request->user()?->id ?: $request->ip();
+RateLimiter::for('ticket-create', fn (Request $request) => Limit::perMinute(10)->by('ticket-create:' . $byUserOrIp($request)));
+```
+
+`throttle:ticket-create` looks up this named limiter; the counter is stored in the cache store under the key built by
+`by(...)`.
+
+> **বাংলায়:** Request lifecycle মানে ব্রাউজার থেকে রিকোয়েস্ট এসে কোন কোন ধাপ পেরিয়ে controller-এ পৌঁছায় আর উত্তর
+> ফেরত যায়। প্রতিটি ধাপ রিকোয়েস্ট থামাতে পারে (419, 403, 429, 422)। কোন status code এসেছে দেখে বোঝা যায় কোন ধাপে
+> সমস্যা — এটা ডিবাগিংয়ের সবচেয়ে বড় সূত্র।
+
+## 27. V2: Services, exceptions and config used by controllers
+
+| Item | Purpose | Example |
+|---|---|---|
+| `TicketService` | create, edit, transitions, comments, SLA | `TicketController::resolve()` → `resolve($ticket, $note, $user, $expectedVersion)` |
+| `TicketAssignmentService` | assign / auto-assign with cache lock + row locks | `TicketController::assign()` |
+| `TicketNotifier` | database notification + after-commit broadcast/email | used by the two services above |
+| `AttachmentService` | store / record / delete files; shared validation rules | `StoreTicketRequest::rules()`, `TicketCommentController::store()` |
+| `ProjectService` | association changes with removal guards | `ProjectController::updateAgents()` |
+| `TicketConflictException` | stale version / reused token | `render()` returns 409 JSON or redirect back with input |
+| `ValidationException::withMessages()` | business-rule failure | "Only Open, Assigned or In Progress tickets can be assigned." |
+| `config('resolvedesk.attachments.max_file_kb')` | business setting in `config/resolvedesk.php` | change limits without touching code |
+
+A custom exception with a `render()` method is Laravel's simplest way to map a domain error to an HTTP response
+without touching `bootstrap/app.php` (`withExceptions` stays empty).

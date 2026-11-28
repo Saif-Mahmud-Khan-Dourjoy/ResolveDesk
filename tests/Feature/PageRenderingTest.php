@@ -3,6 +3,8 @@
 namespace Tests\Feature;
 
 use App\Models\Category;
+use App\Models\Client;
+use App\Models\Project;
 use App\Models\Ticket;
 use App\Models\User;
 use Database\Seeders\DatabaseSeeder;
@@ -56,6 +58,19 @@ class PageRenderingTest extends TestCase
             '/categories/create',
             route('categories.edit', $category),
             '/notifications',
+            // V2 pages
+            '/projects',
+            '/projects/create',
+            route('projects.show', Project::where('code', 'HRMS')->first()),
+            route('projects.edit', Project::where('code', 'HRMS')->first()),
+            '/clients',
+            '/clients/create',
+            route('clients.show', Client::where('code', 'ACME')->first()),
+            route('clients.edit', Client::where('code', 'ACME')->first()),
+            '/reports',
+            '/reports?project_id=global&client_id=internal&status=open',
+            '/tickets?project_id=global',
+            route('users.show', User::where('email', 'sarah.agent@resolvedesk.test')->first()),
         ];
 
         foreach ($urls as $url) {

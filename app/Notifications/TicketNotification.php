@@ -7,7 +7,8 @@ use Illuminate\Notifications\Notification;
 
 /**
  * ONE reusable in-app notification for every ticket event
- * (assigned, reassigned, comment, resolved, reopened, closed).
+ * (created, assigned, reassigned, unassigned, comment, internal_note, resolved,
+ * reopened, closed, sla_breached). Created by TicketNotifier (app/Services).
  *
  * $user->notify(new TicketNotification(...)) inserts one row into the
  * "notifications" table immediately (it is NOT queued), so in-app
@@ -20,8 +21,7 @@ class TicketNotification extends Notification
         public string $eventType,   // e.g. "assigned", "comment", "resolved"
         public string $title,       // short heading shown in bold
         public string $message,     // one-line description
-    ) {
-    }
+    ) {}
 
     /** Which channels to use. "database" = store in the notifications table. */
     public function via(object $notifiable): array

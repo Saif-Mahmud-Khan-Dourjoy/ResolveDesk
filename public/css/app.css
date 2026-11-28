@@ -256,3 +256,10 @@ body {
 .auth-card { width: 100%; max-width: 420px; }
 
 .required::after { content: " *"; color: #dc2626; }
+
+/* V2: internal (staff-only) notes stand out with a yellow left border. */
+.comment-internal .comment-body {
+    background: #fffbea;
+    border-left: 3px solid #f0b429;
+    padding-left: .75rem;
+}

@@ -1,12 +1,20 @@
 # 10 — System Design Guide
 
 This guide explains **how ResolveDesk is designed** and **why** each decision was made.
-Everything in Part A is **implemented** and can be found in the code.
-Everything in Part C is **NOT implemented**. It is only a list of ideas for a bigger system.
+
+- **Part A** (design concepts) and **Part B** (diagrams) describe the base design from V1. It is still valid; where V2
+  changed something, a **V2:** note says so.
+- **Part E** is the **V2 system design** (V2 spec §37): requirements, high-level architecture, ER summary, sequence
+  diagrams (assignment, notification, queue, cache, concurrency), security boundaries, deployment architecture,
+  failure scenarios and scaling. Each item is marked **Implemented** or **Future**.
+- **Part C** lists future ideas (NOT implemented). **Part D** lists trade-offs and known limitations.
 
 Related guides: [Business logic](06-BUSINESS-LOGIC-GUIDE.md) ·
 [Notifications](13-NOTIFICATION-SYSTEM-GUIDE.md) · [Queue and email](14-QUEUE-AND-EMAIL-GUIDE.md) ·
-[Caching](15-CACHING-GUIDE.md) · [Database](03-DATABASE-GUIDE.md) · [Debugging](11-DEBUGGING-GUIDE.md)
+[Caching](15-CACHING-GUIDE.md) · [Database](03-DATABASE-GUIDE.md) · [Debugging](11-DEBUGGING-GUIDE.md) ·
+[Production deployment](18-PRODUCTION-DEPLOYMENT.md) · [Backup and recovery](19-BACKUP-AND-RECOVERY.md) ·
+[Concurrency](20-CONCURRENCY-AND-DATA-INTEGRITY.md) · [Real-time](21-REALTIME-REVERB-ECHO.md) ·
+[V2 features](22-V2-BUSINESS-FEATURES.md) · [Security/ops](23-SECURITY-ERRORS-LOGGING-OPERATIONS.md)
 
 ---
 
@@ -16,34 +24,38 @@ Related guides: [Business logic](06-BUSINESS-LOGIC-GUIDE.md) ·
 - [Part B — Diagrams](#part-b--diagrams)
 - [Part C — Future improvements (NOT implemented)](#part-c--future-improvements-not-implemented)
 - [Part D — Trade-offs and known limitations](#part-d--trade-offs-and-known-limitations)
+- [Part E — V2 system design](#part-e--v2-system-design)
 
 ---
 
-## The system in one paragraph
+## The system in one paragraph (V2)
 
-ResolveDesk is **one Laravel 13 application** (a monolith). Browsers send normal HTML form
-requests and a few JSON (AJAX) requests. Routes pass through middleware (`auth`, `active`,
-`role:admin`), then a controller. The controller checks permission with `TicketPolicy`, validates
-the input, and calls `TicketService` for ticket business rules. Data lives in **one MariaDB/MySQL
-database**. The same database also stores the **cache** (`cache` table), the **queue** (`jobs` and
-`failed_jobs` tables), the **sessions** (`sessions` table) and the **in-app notifications**
-(`notifications` table). A separate process, `php artisan queue:work`, sends emails in the
-background. The browser asks for new notifications every 5 seconds (AJAX polling).
+ResolveDesk is **one Laravel 13 application** (a modular monolith). Browsers send normal HTML form requests and a few
+JSON requests. Routes pass through middleware (`web` + `AddRequestContext`, `auth`, `active`, `role:admin`,
+`throttle:*`), then a controller. The controller checks permission with `TicketPolicy` (or a Form Request), validates
+the input, and calls a service (`TicketService`, `TicketAssignmentService`, `ProjectService`, `AttachmentService`).
+Data lives in **one MariaDB/MySQL database**, which also stores the **cache** and **atomic locks** (`cache`,
+`cache_locks`), the **queue** (`jobs`, `failed_jobs`), the **sessions** and the **in-app notifications**. Three
+long-running helper processes run next to the web server: `php artisan queue:work` (emails),
+`php artisan reverb:start` (WebSocket push on private channels `users.{id}`) and the scheduler
+(`schedule:work` locally / cron `schedule:run`) which runs `tickets:check-sla` every minute. Attachments are stored on
+the private local disk. If Reverb is down, the browser falls back to polling every 5 seconds.
 
 | Piece | Implemented with | Where configured |
 |---|---|---|
 | Web framework | Laravel 13.44.1, PHP 8.4.28 | `composer.json` |
-| Database | MariaDB 10.4 (XAMPP) — code is MySQL 8 compatible | `.env` `DB_CONNECTION=mysql` |
-| Sessions | Database driver | `.env` `SESSION_DRIVER=database` |
-| Cache | Database driver (`cache` table) | `.env` `CACHE_STORE=database` |
-| Queue | Database driver (`jobs`, `failed_jobs`) | `.env` `QUEUE_CONNECTION=database` |
-| Mail | `log` mailer (emails written to `storage/logs/laravel.log`) | `.env` `MAIL_MAILER=log` |
-| Frontend | Blade + Bootstrap 5.3 + Vanilla JS | `resources/views`, `public/js` |
+| Database | MariaDB 10.4 (XAMPP) — MySQL 8 is the target but was **not tested** | `.env` `DB_CONNECTION=mysql` |
+| Sessions | Database driver | `SESSION_DRIVER=database` |
+| Cache + locks | Database driver (`cache`, `cache_locks`) | `CACHE_STORE=database` |
+| Queue | Database driver (`jobs`, `failed_jobs`) | `QUEUE_CONNECTION=database` |
+| Real-time | Laravel Reverb 1.14 + Echo/pusher-js (Vite bundle) | `BROADCAST_CONNECTION=reverb`, `REVERB_*`, `VITE_REVERB_*` |
+| Scheduler | `routes/console.php` | cron / `schedule:work` |
+| Files | `local` private disk (`storage/app/private`) | `config/resolvedesk.php` |
+| Mail | `log` mailer | `MAIL_MAILER=log` |
+| Frontend | Blade + Bootstrap 5.3 + Vanilla JS | `resources/views`, `public/js`, `resources/js/realtime.js` |
 
-> Note: the project specification asks for MySQL 8.x. Only MariaDB 10.4 is installed on the
-> development PC, so the app was built and tested on MariaDB (see `DEVELOPMENT_PROGRESS.md`).
-> The only database-specific SQL is `TIMESTAMPDIFF` and `DATE()` in `DashboardController`, and both
-> work on MySQL 8 too.
+> Note: the only database-specific SQL is `TIMESTAMPDIFF` and `DATE()` in `DashboardController`; both work on MySQL 8.
+> InnoDB `FOR UPDATE` / `LOCK IN SHARE MODE` behave the same on MariaDB 10.4 for this project.
 
 ---
 
@@ -99,13 +111,14 @@ Each class has one clear job:
 | "Is the user logged in and active?" | `auth` middleware + `app/Http/Middleware/ActiveUserMiddleware.php` | deactivated user is logged out on the next request |
 | "Does the user have this role?" | `app/Http/Middleware/RoleMiddleware.php` (`role:admin`) | customer opening `/users` → 403 |
 | "May THIS user do THIS action on THIS ticket?" | `app/Policies/TicketPolicy.php` | `Gate::authorize('resolve', $ticket)` |
-| "Is the input valid?" | `$request->validate([...])` in controllers | `'priority' => ['required', Rule::in(array_keys(Ticket::PRIORITIES))]` |
+| "Is the input valid?" | `$request->validate([...])` in controllers; V2: `StoreTicketRequest` for ticket creation | `'priority' => ['required', Rule::in(array_keys(Ticket::PRIORITIES))]` |
 | "What are the business rules?" | `app/Services/TicketService.php` | lock ticket, check transition, save, activity, notify |
 | "How do we send an email?" | `app/Jobs/SendTicketEmail.php` + `app/Mail/TicketUpdateMail.php` | |
 | "What does an in-app notification contain?" | `app/Notifications/TicketNotification.php` | |
 
-**Important decision:** only **ticket** operations use a service class, because they coordinate many
-steps. Plain CRUD (users, categories) stays inside the controller. This avoids unnecessary abstraction
+**Important decision:** only operations that coordinate many steps use a service class (V2: ticket rules,
+assignment, notification delivery, attachments, project associations). Plain CRUD (users, categories, clients, project
+fields) stays inside the controller. This avoids unnecessary abstraction
 (see `DEVELOPMENT_PROGRESS.md` → "Important decisions").
 
 **Two different questions, two different places:**
@@ -235,10 +248,12 @@ See the [ticket lifecycle diagram](#b7-ticket-lifecycle).
 
 ## A8. Workload-based assignment
 
+> **V2:** only agents linked to the ticket's project are eligible (`findLeastBusyAgent($projectId)`, `Ticket::canBeAssignedTo()`), and assignment runs under the global `Cache::lock('ticket-assignment')` so parallel auto-assigns cannot pick the same agent. See E7.
+
 **What:** "Auto Assign" picks the **active agent with the fewest Assigned + In Progress tickets**.
 Ties are broken by the lowest `id` so the result is deterministic (and testable).
 
-**Where:** `TicketService::findLeastBusyAgent()`:
+**Where:** `TicketAssignmentService::findLeastBusyAgent()`:
 
 ```php
 return User::where('role', User::ROLE_AGENT)
@@ -268,7 +283,7 @@ every ticket into PHP. The composite index `['assigned_to', 'status']` on `ticke
 **What:** Every important ticket change writes one row to `ticket_activities`
 (`ticket_id`, `user_id`, `action`, `old_value`, `new_value`, timestamps).
 
-**Where:** `TicketService::recordActivity()`, called inside the same transaction as the change.
+**Where:** `TicketActivity::record()`, called inside the same transaction as the change.
 Action names and labels: `TicketActivity::ACTION_LABELS`
 (`created`, `updated`, `assigned`, `reassigned`, `priority_changed`, `due_date_changed`,
 `status_changed`, `resolved`, `reopened`, `closed`).
@@ -280,6 +295,8 @@ change can never be saved without its history.
 stores the old resolution note: `'Previous resolution: ' . $previousNote`.
 
 ## A10. ACID transactions and row locking
+
+> **V2:** plus optimistic locking (`version`), a shared lock on the project row, deadlock retry `DB::transaction(..., 3)` and idempotent creation. See E11 and [20](20-CONCURRENCY-AND-DATA-INTEGRITY.md).
 
 **What:** Every `TicketService` write method wraps its work in `DB::transaction(function () { ... })`.
 
@@ -429,7 +446,7 @@ request could rebuild the cache from the **old** (not yet committed) data.
 **Why:** SMTP can take seconds or fail. The user who clicks **Assign** should not wait for Gmail, and a
 mail-server problem must not roll back a valid assignment.
 
-**Where:** `TicketService::queueEmail()`:
+**Where:** `TicketNotifier::queueEmail()`:
 
 ```php
 DB::afterCommit(function () use ($recipientEmail, $recipientName, $emailData) {
@@ -453,7 +470,7 @@ Three design decisions:
    `event_title`, `event_message`), not Eloquent models. The payload is small and independent of later changes.
 
 **Which events email?** Only `created` (to every active admin, except the creator), `assigned`, `reassigned`,
-`resolved`, `reopened` (the `true` last argument of `notifyUser()`). Comments and closure are in-app only.
+`resolved`, `reopened` (the `true` last argument of `TicketNotifier::notify()`). Comments and closure are in-app only.
 The `created` → admins email was added at the project owner's request, beyond MASTER_PROMPT §9.2.
 
 **In-app notifications are not queued.** `TicketNotification::via()` returns `['database']` and the class
@@ -464,7 +481,7 @@ worker runs.
 
 | Role | ResolveDesk |
 |---|---|
-| **Producer** | `TicketService::queueEmail()` → `SendTicketEmail::dispatch(...)` inserts a row into `jobs` |
+| **Producer** | `TicketNotifier::queueEmail()` → `SendTicketEmail::dispatch(...)` inserts a row into `jobs` |
 | **Buffer** | `jobs` table (database queue driver) |
 | **Consumer** | `php artisan queue:work` process → reserves a row → runs `SendTicketEmail::handle()` → deletes the row |
 
@@ -501,6 +518,8 @@ then crashes, the job becomes available again after 90 seconds.
 - The ticket change is **not** affected — it was committed long before.
 
 ## A20. AJAX polling
+
+> **V2:** polling is now the **fallback**. Real-time delivery uses Reverb (E8); `notifications.js` stops continuous polling while the WebSocket channel is healthy.
 
 **What:** `public/js/notifications.js` asks `GET /notifications/feed` every 5 seconds and updates the
 bell badge, the dropdown, and shows Bootstrap toasts for new notifications.
@@ -565,6 +584,8 @@ Rules of this small internal API:
 All diagrams show **implemented** behaviour.
 
 ## B1. Overall architecture
+
+> **V2:** the current architecture (with Reverb, scheduler and private disk) is in E4. B1–B7 show the V1 base flows, still valid.
 
 ```mermaid
 flowchart LR
@@ -644,6 +665,8 @@ sequenceDiagram
 
 ## B3. Ticket assignment (manual and automatic)
 
+> **V2:** see E7 for the current sequence with the cache lock, project shared lock and held side effects.
+
 ```mermaid
 sequenceDiagram
     actor A as Admin
@@ -678,6 +701,8 @@ sequenceDiagram
 
 ## B4. Notification polling
 
+> **V2:** see E8 for the real-time path; this polling flow is the fallback.
+
 ```mermaid
 sequenceDiagram
     participant JS as notifications.js
@@ -710,7 +735,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["TicketService::notifyUser(..., sendEmail = true)"] --> B["queueEmail(): DB::afterCommit(closure)"]
+    A["TicketNotifier::notify(..., sendEmail = true)"] --> B["queueEmail(): DB::afterCommit(closure)"]
     B --> C{"Transaction committed?"}
     C -- "No (rollback)" --> D["Closure discarded<br/>no job, no email"]
     C -- "Yes" --> E["SendTicketEmail::dispatch()"]
@@ -768,81 +793,407 @@ stateDiagram-v2
 
 # Part C — Future improvements (NOT implemented)
 
-> **Everything in this part is NOT in the code.** These are ideas to discuss in an interview when asked
-> "How would you scale this?". Do not describe them as existing features.
+> **Everything in this table is NOT in the code.** These are ideas to discuss when asked "How would you scale this?".
+
+**Moved to "implemented" by V2** (no longer future): Laravel Reverb / WebSockets (old C4/C5), scheduled SLA reminders
+(old C12), a practical email de-dup key (old C13, best effort), attachments on a private disk (object storage remains
+future). See Part E.
 
 | # | Idea | Problem it would solve in ResolveDesk | What would change | Trade-off |
 |---|---|---|---|---|
-| C1 | **Redis cache** | `CACHE_STORE=database` still runs a SQL query to read the cache | `.env` `CACHE_STORE=redis`; same `Cache::remember()` code works unchanged | New server to run and monitor; data in memory |
-| C2 | **Redis queue** | Database queue polls the `jobs` table and locks rows; heavy load hurts the main DB | `QUEUE_CONNECTION=redis`; same `SendTicketEmail` class | Redis must be persistent/backed up or queued jobs can be lost |
-| C3 | **Multiple queue workers** | One worker sends emails one by one | Run several `queue:work` processes (Supervisor on Linux, a service on Windows) | Jobs may run in a different order; need idempotency (C13) |
-| C4 | **Laravel Reverb** | Notifications arrive up to 5 s late and every tab polls | First-party Laravel WebSocket server; broadcast `TicketNotification` on a private channel | Extra long-running process, more moving parts |
-| C5 | **WebSockets (general)** | Polling wastes requests when nothing is new | Persistent two-way connection; server pushes instantly | Connection management, scaling sticky connections, auth on channels |
-| C6 | **Server-Sent Events (SSE)** | Same as above, but one-way push is enough for notifications | One long HTTP response streaming events to the browser | Holds a PHP worker per open tab with classic PHP-FPM |
-| C7 | **Load balancer** | One `php artisan serve` handles all traffic | Nginx/HAProxy/cloud LB in front of many app servers | Need shared state (C9) and health checks (`/up` route already exists from the skeleton) |
-| C8 | **Multiple application servers** | One server is a single point of failure | Same code on N servers behind C7 | Deployments must update all servers; local files must not be used for shared data |
-| C9 | **Shared sessions** | Sessions on one server would not be seen by another | Already **partly ready**: `SESSION_DRIVER=database` stores sessions in the shared DB. At scale, move to Redis | DB session writes on every request add DB load |
-| C10 | **Database read replicas** | Dashboard and list reads compete with writes | Laravel `read`/`write` hosts in `config/database.php` | Replication lag: a user may not see their own change immediately |
-| C11 | **Object storage** | Not needed today (no attachments) — becomes needed if file attachments are added | Store files on S3-compatible storage via the `Storage` facade | Cost, signed URLs for private files |
-| C12 | **Scheduled SLA escalation** | Today "overdue" is only **calculated live** (`isOverdue()`, `overdue()` scope); nobody is alerted | A Laravel Scheduler task (e.g. every 5 minutes) that finds overdue tickets and notifies admins once, plus `php artisan schedule:work` / a cron entry | Must avoid alerting twice (store an `escalated_at` column) |
-| C13 | **Idempotent processing** | A retried `SendTicketEmail` can send the same email twice | Give each email a unique key; record "sent" in a table before/after sending and skip if already sent | Extra table/write per email |
-| C14 | **Transactional outbox** | `DB::afterCommit()` + `dispatch()` is not atomic: if the process dies after COMMIT but before the job is stored, the email is lost (we only log dispatch errors) | Insert an "outbox" row **inside** the same transaction; a separate relay moves outbox rows to the queue | More code, a relay process, still needs idempotent consumers |
+| C1 | **Redis cache + locks** | `CACHE_STORE=database` runs SQL for every cache read and lock attempt | `CACHE_STORE=redis`; `Cache::remember()` and `Cache::lock()` code unchanged | New server to run, monitor, secure |
+| C2 | **Redis queue** | The database queue polls `jobs` and competes with app queries | `QUEUE_CONNECTION=redis`; same `SendTicketEmail` | Redis persistence/backup needed |
+| C3 | **Multiple queue workers** | One worker sends emails one by one | Several `queue:work` processes under Supervisor | Ordering not guaranteed; consumers must stay idempotent |
+| C4 | **Reverb horizontal scaling** | One Reverb process is a single point of failure and has a connection limit | Several Reverb servers with `REVERB_SCALING_ENABLED=true` (Redis pub/sub) behind a WebSocket-aware load balancer | Redis required; more ops work |
+| C5 | **Server-Sent Events** | Alternative one-way push | Streamed HTTP response | Holds a PHP worker per tab with PHP-FPM |
+| C6 | **Load balancer** | One web server handles all traffic | Nginx/HAProxy/cloud LB, health checks on `/up` and `/health/ready` (both exist) | Shared state needed (C8) |
+| C7 | **Multiple application servers** | Single point of failure | Same release on N servers | Deploy to all; no local state |
+| C8 | **Shared sessions** | Sessions must be visible on every server | Already shared via `SESSION_DRIVER=database`; Redis at higher load | DB write per request today |
+| C9 | **Shared object storage** | Attachments live on one server's disk | `ATTACHMENT_DISK=s3` (`config/resolvedesk.php` reads it) + S3 Flysystem package; `Storage::disk()` code unchanged | Cost, network latency, bucket policy |
+| C10 | **Read replicas** | Reports/dashboards compete with writes | `read`/`write` hosts in `config/database.php` | Replication lag; locks must use the primary |
+| C11 | **Scheduler on one server** | With several servers, each cron would run `tickets:check-sla` | `->onOneServer()` with a shared cache store | Needs shared cache (DB or Redis) |
+| C12 | **Transactional outbox** | Crash between COMMIT and job dispatch loses an email | Outbox row in the same transaction + relay process | More code and a relay |
+| C13 | **Centralized monitoring** | Logs are files per server; no metrics | Log shipping (ELK/Loki), error tracker, uptime checks, queue-length alerts | Cost and setup |
+| C14 | **Agent availability / customer manager role** | Business extensions | New column + eligibility rule; new policy branch on `client_id` | More rules to test |
 
-### Short explanations
-
-- **Redis vs database cache:** Redis keeps keys in RAM, so reads take microseconds and do not touch MySQL.
-  ResolveDesk only caches two small keys, so the database store is acceptable today.
-- **Reverb/WebSockets/SSE vs polling:** polling is "ask every 5 seconds"; push is "server tells you when
-  something happens". Push gives instant delivery and fewer empty requests, but needs a long-running server.
-- **Scaling the web tier:** a load balancer spreads requests over several identical servers. Anything stored
-  on one server's disk or memory (sessions, cache, uploaded files) must move to a shared store first.
-- **Read replicas:** copies of the database that receive changes from the primary. Reads go to replicas,
-  writes to the primary.
-- **Outbox:** the ticket change and the "please send email" message are saved in the **same** transaction,
-  so they can never disagree.
-
-> **বাংলায়:** এই অংশের কোনো কিছুই এখন code-এ নেই — এগুলো শুধু ভবিষ্যতে বড় system-এর জন্য ধারণা।
-> Interview-তে "কীভাবে scale করবেন?" প্রশ্ন এলে বলবেন: cache ও queue Redis-এ নেব, একাধিক worker চালাব,
-> polling-এর বদলে Reverb/WebSocket দিয়ে push করব, load balancer-এর পেছনে একাধিক server রাখব, আর
-> duplicate email ঠেকাতে idempotency ও transactional outbox ব্যবহার করব।
-
-> **বাংলায় (Outbox ও Idempotency):** Idempotent মানে একই কাজ দুবার চালালেও ফলাফল একবারের মতোই থাকে —
-> যেমন email আগে পাঠানো হয়ে থাকলে আবার পাঠাবে না। Transactional outbox মানে ticket-এর পরিবর্তন আর
-> "email পাঠাতে হবে" বার্তা একই transaction-এ database-এ লেখা, যাতে একটা save হয়ে অন্যটা হারিয়ে না যায়।
+> **বাংলায়:** এই টেবিলের কিছুই এখন কোডে নেই — "কীভাবে scale করবেন?" প্রশ্নে বলবেন: Redis-এ cache/queue/lock,
+> একাধিক worker, load balancer-এর পেছনে একাধিক server, Reverb-এর Redis scaling, S3-তে ফাইল, read replica আর
+> কেন্দ্রীয় monitoring। আর পরিষ্কার বলবেন যে Reverb আর scheduler V2-তে **implemented**।
 
 ---
 
-# Part D — Trade-offs and known limitations
+# Part D — Trade-offs and known limitations (V2)
 
-These are honest limitations of the **current** implementation. Knowing them is a strength in an interview.
-
-| # | Limitation | Why it happens | Impact | Possible fix (not implemented) |
+| # | Limitation | Why | Impact | Possible fix |
 |---|---|---|---|---|
-| D1 | **Concurrent auto-assign of different tickets can pick the same agent** | `autoAssign()` locks only the **ticket** row (`lockTicket()`), not the agent workload. Two admins auto-assigning ticket A and ticket B at the same moment can both read "Michael has 2" and both assign to Michael. | Workload can become slightly unbalanced (never corrupt data). | Lock the agent rows too (`lockForUpdate()` on the chosen user) or use an atomic counter. |
-| D2 | **Duplicate email possible on retry** | A job may send the email and then fail (or the worker may crash) before the job row is deleted. With `$tries = 3` the job runs again. Also if a send takes longer than `retry_after` (90 s), another worker could pick it up. | Recipient may get the same email twice. | Idempotency key (C13). |
-| D3 | **Email can be lost between COMMIT and dispatch** | `DB::afterCommit()` runs after COMMIT; if dispatch fails, we only `Log::error()`. | In-app notification exists, email does not. | Transactional outbox (C14). |
-| D4 | **Database cache still hits the database** | `CACHE_STORE=database` reads the `cache` table. It saves the **expensive** aggregate queries, but not the round-trip to MySQL. | Smaller benefit than Redis. | Redis cache (C1). |
-| D5 | **Dashboard numbers can be up to 60 s stale** | Only if data changes outside `TicketService`/`CategoryController` (e.g. direct SQL, phpMyAdmin, tinker). Normal app writes clear the key. | Admin sees old counts for up to 60 s. | `php artisan cache:clear` or `Cache::forget('dashboard:admin:stats')`. |
-| D6 | **Notification latency up to ~5 s (30 s in a hidden tab)** | Polling interval `POLL_INTERVAL_MS = 5000`, `HIDDEN_POLL_INTERVAL_MS = 30000`. | Not instant. | Reverb/WebSockets/SSE (C4–C6). |
-| D7 | **Polling load grows with open tabs** | Each open tab sends 1 request / 5 s → 3 queries each (latest 5, unread count, since-query). | Fine for a small team; heavy for thousands of users. | Push (C4) or longer interval. |
-| D8 | **No automatic SLA escalation** | Overdue is calculated live only when someone views a page. | Nobody is alerted when a ticket becomes overdue. | Scheduler task (C12). |
-| D9 | **Reopen keeps the original SLA deadline** | Deliberate simplified rule in `TicketService::reopen()`. | A reopened ticket can be immediately overdue. | Recalculate `due_at` on reopen if the business wants it. |
-| D10 | **Single server, single DB** | Monolith design. | Single point of failure. | C7–C10. |
-| D11 | **SLA uses calendar hours** | `Ticket::calculateDueAt()` adds hours with `addHours()`. | Weekends/nights count. | Business-hours calendar. |
-
-> **বাংলায়:** D1 উদাহরণ: দুজন admin একই মুহূর্তে দুটো আলাদা ticket auto-assign করলে, দুজনেই একই
-> agent-কে "সবচেয়ে কম কাজ" দেখে assign করতে পারে, কারণ আমরা শুধু ticket row lock করি, agent নয়। Data নষ্ট হয়
-> না, শুধু কাজের ভাগ একটু অসমান হতে পারে। D2 উদাহরণ: email পাঠানোর পর job delete হওয়ার আগে worker crash
-> করলে retry-তে একই email দুবার যেতে পারে।
+| D1 | ~~Concurrent auto-assign picks the same agent~~ **Fixed in V2** | Global `Cache::lock('ticket-assignment')` serializes assignment | — | — |
+| D2 | Assignment is serialized globally | One lock for all assignments; 5 s wait, 10 s expiry | Under heavy load admins may see "try again" | Per-project locks (careful: workload is global) |
+| D3 | Duplicate email still possible | Cache de-dup key is written after SMTP accepts; a crash in between repeats the send | Rare duplicate | Outbox + provider idempotency keys (C12) |
+| D4 | Email can be lost between COMMIT and dispatch | `DB::afterCommit()` + dispatch is not atomic; error only logged | In-app notification exists, email does not | Outbox (C12) |
+| D5 | Single Reverb server, every tab its own socket | No scaling configured | Each tab shows the toast; Reverb outage → 5 s polling | C4 |
+| D6 | `ShouldBroadcastNow` inside the request | Broadcast is an HTTP call to Reverb after commit | If Reverb hangs, the response waits up to the broadcaster timeout (connect 2 s / 3 s) | Queued `ShouldBroadcast` (needs worker) |
+| D7 | Database used for everything | No Redis on XAMPP | More DB load at scale | C1, C2 |
+| D8 | Timestamps in `Asia/Dhaka`, not UTC | V1 data stored that way | Care needed across time zones | Planned UTC migration |
+| D9 | Dashboard stats up to 60 s stale for out-of-band changes | Direct SQL bypasses `Cache::forget()` | Old counts briefly | `cache:clear` |
+| D10 | Reopen keeps the original SLA deadline | Simplified rule | Reopened ticket may be overdue at once (a fresh reminder is sent because `sla_notified_at` is reset) | Recalculate on reopen |
+| D11 | Calendar-hour SLA | `addHours()` | Nights/weekends count | Business-hours calendar |
+| D12 | No antivirus scan, no attachment delete | Out of scope | Risky files can be uploaded (but are never executed or rendered inline) | ClamAV job, delete UI |
+| D13 | Single server, single DB | Monolith deployment | Single point of failure | C6–C10 |
 
 ---
 
-## Interview summary (30 seconds)
+## Interview summary (30 seconds, V2)
 
-"ResolveDesk is a Laravel MVC monolith on one MySQL-compatible database. Middleware handles login, active
-status and roles; `TicketPolicy` handles per-ticket permissions; `TicketService` runs every ticket change in a
-transaction with a row lock, writes an audit trail, inserts an in-app notification, and pushes an email job
-only after commit. A database queue worker sends emails with 3 tries and a 10-second backoff; failures go to
-`failed_jobs`. Admin statistics and the category dropdown use cache-aside with explicit invalidation. The
-browser polls a JSON endpoint every 5 seconds for notifications. To scale, I would move cache and queue to
-Redis, add workers, replace polling with Reverb, and add idempotency/outbox for exactly-once email."
+"ResolveDesk is a Laravel modular monolith on one MySQL-compatible database. Middleware handles login, active status,
+roles, rate limits and request ids; `TicketPolicy` handles per-ticket permissions; services run every change in a
+transaction with row locks and a version check, and assignment additionally takes a global cache lock. Ticket creation
+is idempotent through a request token. The in-app notification is written in the transaction; after commit a tiny event
+goes to Reverb on the user's private channel and an email job goes to the database queue. If Reverb is down, polling
+takes over. A scheduler sends one SLA reminder per breach. Files are private and downloaded through a policy. To scale,
+I'd add Redis, more web servers and workers behind a load balancer, Reverb scaling, S3 and a read replica — none of that
+is implemented yet."
+
+---
+
+# Part E — V2 system design
+
+Legend: **[I]** = implemented in the code · **[F]** = future, not implemented.
+
+## E1. Business requirements
+
+- A software company supports **many products (projects)** used by **many client organizations**. **[I]**
+- Each client has customer users; each support engineer supports several projects. **[I]**
+- Tickets may belong to project + client, project only (internal), client only, or neither (global). **[I]**
+- Client data must never leak to another client; internal discussion must stay internal. **[I]**
+- Work should go only to engineers who know the product, balanced by workload. **[I]**
+- Deadlines (SLA) must be watched automatically. **[I]**
+- Managers need per-project and per-client reporting. **[I]**
+
+## E2. Functional requirements
+
+| Requirement | Status | Main code |
+|---|---|---|
+| Project and client CRUD, activate/deactivate, associations | [I] | `ProjectController`, `ClientController`, `ProjectService` |
+| Role-based ticket scope on creation | [I] | `TicketService::resolveScope()`, `StoreTicketRequest` |
+| Assignment limited to project agents, least-workload auto-assign | [I] | `TicketAssignmentService` |
+| Controlled lifecycle | [I] | `Ticket::TRANSITIONS`, `TicketService` |
+| Public replies and internal notes | [I] | `TicketService::addComment()`, `TicketComment::scopeVisibleTo()` |
+| Private attachments | [I] | `AttachmentService`, `TicketAttachmentController` |
+| Activity history incl. system activities | [I] | `TicketActivity::record()` |
+| Database + real-time notifications, polling fallback | [I] | `TicketNotifier`, `UserNotificationCreated`, `realtime.js`, `notifications.js` |
+| Queued email | [I] | `SendTicketEmail` |
+| SLA breach reminder (once) | [I] | `CheckSlaBreaches`, `processSlaBreach()` |
+| Dashboards, reports, CSV export | [I] | `DashboardController`, `ReportController` |
+| Customer manager role, agent availability | [F] | — |
+
+## E3. Non-functional requirements
+
+| Quality | How it is met | Status |
+|---|---|---|
+| Correctness under concurrency | transactions, row locks, version column, cache lock, unique token index, deadlock retry | [I] |
+| Security | layered authorization, CSRF, escaping, private channels, private files, rate limits | [I] |
+| Availability of core function | graceful degradation (Reverb, worker, scheduler optional) | [I] |
+| Performance | indexes for new access paths, eager loading + `preventLazyLoading`, cached aggregates, `chunkById` | [I] |
+| Observability | `X-Request-Id` + log context, `/up`, `/health/ready`, daily logs in production | [I] (production logging documented, not deployed) |
+| Maintainability | plain Laravel, five small services, config in `config/resolvedesk.php`, 164 tests | [I] |
+| Horizontal scalability | shared DB state is a start; Redis/LB/S3 needed | [F] |
+
+## E4. High-level architecture
+
+```mermaid
+flowchart LR
+    subgraph Client["Browser"]
+        Pages["Blade pages"]
+        Poll["notifications.js<br/>feed + polling fallback"]
+        EchoC["realtime.js<br/>Echo + pusher-js"]
+    end
+    subgraph App["Laravel app (one codebase)"]
+        Web["HTTP: routes, middleware,<br/>controllers, policies"]
+        Svc["Services: Ticket, Assignment,<br/>Notifier, Attachment, Project"]
+        Worker["queue:work<br/>SendTicketEmail"]
+        Sched["scheduler<br/>tickets:check-sla"]
+    end
+    Reverb["Reverb WebSocket server"]
+    DB[("MariaDB/MySQL: business tables,<br/>notifications, jobs, cache,<br/>cache_locks, sessions")]
+    Disk[("Private disk:<br/>attachments")]
+    SMTP["Mail (log / SMTP)"]
+
+    Pages -->|"HTTPS forms"| Web
+    Poll -->|"GET /notifications/feed"| Web
+    EchoC -->|"POST /broadcasting/auth"| Web
+    EchoC <-->|"WebSocket"| Reverb
+    Web --> Svc
+    Svc --> DB
+    Svc --> Disk
+    Svc -->|"after commit: broadcast"| Reverb
+    Svc -->|"after commit: job row"| DB
+    Worker -->|"reserve job"| DB
+    Worker --> SMTP
+    Sched --> Svc
+```
+
+**Modular monolith:** one deployable app, but code is grouped by responsibility (services per concern, one policy, one
+event, one command). No microservices — one team, one database, simpler transactions. **[I]**
+
+## E5. ER summary (V2 tables)
+
+```mermaid
+erDiagram
+    clients ||--o{ users : "customers (client_id)"
+    clients ||--o{ client_project : ""
+    projects ||--o{ client_project : ""
+    projects ||--o{ project_user : ""
+    users ||--o{ project_user : "agents"
+    projects ||--o{ tickets : "project_id (nullable)"
+    clients ||--o{ tickets : "client_id (nullable)"
+    users ||--o{ tickets : "created_by / assigned_to"
+    categories ||--o{ tickets : ""
+    tickets ||--o{ ticket_comments : ""
+    tickets ||--o{ ticket_activities : ""
+    tickets ||--o{ ticket_attachments : ""
+    ticket_comments ||--o{ ticket_attachments : "ticket_comment_id (nullable)"
+    users ||--o{ notifications : "notifiable"
+```
+
+Key V2 columns: `tickets.version`, `tickets.request_token` (unique with `created_by`), `tickets.sla_notified_at`,
+`ticket_comments.visibility`, `ticket_activities.is_internal` + nullable `user_id`. Full detail:
+[03-DATABASE-GUIDE.md](03-DATABASE-GUIDE.md).
+
+## E6. Request lifecycle and ticket lifecycle
+
+Request: `public/index.php` → `web` group (session, CSRF) → `AddRequestContext` → `auth`, `active`, (`role:admin`),
+(`throttle:*`) → route model binding → Form Request / `Gate::authorize()` + validation → service (transaction, locks)
+→ after-commit side effects → response with `X-Request-Id`. Details: [04](04-LARAVEL-MVC-GUIDE.md) §26.
+
+Ticket lifecycle is unchanged from V1 (Part B7): `open → assigned → in_progress → resolved → closed`, `resolved →
+in_progress` (reopen). V2 adds `version + 1` on every mutation and the SLA reminder flag.
+
+## E7. Assignment sequence (manual or auto) **[I]**
+
+```mermaid
+sequenceDiagram
+    participant A as Admin browser
+    participant C as TicketController::assign / autoAssign
+    participant S as TicketAssignmentService
+    participant L as Cache lock (cache_locks)
+    participant DB as Database
+    participant N as TicketNotifier
+    A->>C: POST /tickets/35/assign (agent_id, version, _token)
+    C->>C: Gate::authorize('assign') + validate
+    C->>S: assignAgent(ticket, agent, admin, version)
+    S->>N: holdSideEffects()
+    S->>L: Cache::lock('ticket-assignment', 10)->block(5)
+    L-->>S: acquired (or LockTimeoutException -> "try again")
+    S->>DB: BEGIN
+    S->>DB: SELECT projects ... LOCK IN SHARE MODE
+    S->>DB: SELECT tickets WHERE id=35 FOR UPDATE
+    S->>S: ensureVersion, status active?, canBeAssignedTo(agent)?, same agent?
+    S->>DB: UPDATE tickets SET assigned_to, status, version+1
+    S->>DB: INSERT ticket_activities (assigned, status_changed)
+    S->>N: notify(agent) -> INSERT notifications
+    S->>DB: COMMIT (afterCommit callbacks are HELD)
+    S->>L: release lock
+    S->>N: releaseSideEffects() -> broadcast + dispatch email
+    S->>S: Cache::forget('dashboard:admin:stats')
+    C-->>A: 302 back "Ticket assigned to Sarah"
+```
+
+Auto-assign is the same, but inside the lock it requires status Open and calls `findLeastBusyAgent($projectId)` on
+fresh data.
+
+## E8. Notification and real-time sequence **[I]**
+
+```mermaid
+sequenceDiagram
+    participant Svc as Service (in transaction)
+    participant N as TicketNotifier
+    participant DB as Database
+    participant R as Reverb
+    participant E as realtime.js (Echo)
+    participant P as notifications.js
+    Svc->>N: notify(recipient, ticket, actor, ...)
+    N->>DB: INSERT notifications (id = UUID)
+    Note over N,DB: rolled back together with the ticket change
+    Svc->>DB: COMMIT
+    N->>R: after commit: UserNotificationCreated (private-users.7, {notification_id})
+    N->>DB: after commit: INSERT jobs (SendTicketEmail) if email
+    R-->>E: notification.created
+    E->>P: window event resolvedesk:realtime-notification
+    P->>DB: GET /notifications/feed?since=... (authorized, throttled)
+    P-->>P: badge + toast (de-duplicated by id)
+    Note over P: if socket unhealthy: poll every 5 s (30 s hidden tab)
+```
+
+Channel subscription beforehand: Echo → `POST /broadcasting/auth` → `routes/channels.php` → allowed only for the same
+active user.
+
+## E9. Queue processing flow **[I]**
+
+```mermaid
+flowchart TD
+    A["TicketNotifier::queueEmail()"] --> B["DB::afterCommit: SendTicketEmail::dispatch(plain strings + array)"]
+    B --> C[("jobs table")]
+    C --> D["queue:work reserves the job"]
+    D --> E{"Cache has ticket-email-sent:{id}?"}
+    E -->|"yes"| F["skip, log info"]
+    E -->|"no"| G["Mail::send(TicketUpdateMail)"]
+    G -->|"ok"| H["Cache::put key 2 days, delete job"]
+    G -->|"error / timeout 60 s"| I{"attempts < 3?"}
+    I -->|"yes"| J["release with 10 s backoff"] --> C
+    I -->|"no"| K["failed_jobs + failed() logs"]
+```
+
+Producer–consumer: the web request produces, the worker consumes; `retry_after` (90 s) > `$timeout` (60 s).
+
+## E10. Cache flow **[I]**
+
+```mermaid
+flowchart LR
+    R["Admin opens /dashboard"] --> Q{"Cache::remember('dashboard:admin:stats', 60)"}
+    Q -->|"hit"| V["cached array"]
+    Q -->|"miss"| B["buildAdminStatistics(): GROUP BY status, priority, project, client, SLA"] --> S["store 60 s"] --> V
+    W["Ticket / project / client / user / category change committed"] --> F["Cache::forget('dashboard:admin:stats')"]
+    V --> Live["+ live: overdue count, workload, recent tickets, recent activity"]
+```
+
+Cache-aside with explicit invalidation; locks use the same store. Details: [15-CACHING-GUIDE.md](15-CACHING-GUIDE.md).
+
+## E11. Concurrency sequence diagrams **[I]**
+
+**Optimistic locking — two admins edit the same ticket:**
+
+```mermaid
+sequenceDiagram
+    participant A1 as Admin 1
+    participant A2 as Admin 2
+    participant DB as tickets row (version 4)
+    A1->>DB: open edit form (version 4)
+    A2->>DB: open edit form (version 4)
+    A1->>DB: UPDATE ... SET version = 5 WHERE id = 35 AND version = 4
+    DB-->>A1: 1 row -> saved
+    A2->>DB: UPDATE ... SET version = 5 WHERE id = 35 AND version = 4
+    DB-->>A2: 0 rows -> TicketConflictException (409 / redirect back with input)
+```
+
+**Idempotent creation — double submit:**
+
+```mermaid
+sequenceDiagram
+    participant B as Browser (double click)
+    participant S1 as Request 1
+    participant S2 as Request 2
+    participant DB as tickets (UNIQUE created_by, request_token)
+    B->>S1: POST /tickets token T
+    B->>S2: POST /tickets token T
+    S1->>DB: findByRequestToken -> none; INSERT
+    S2->>DB: findByRequestToken -> none; INSERT
+    DB-->>S1: ok (ticket 36)
+    DB-->>S2: UniqueConstraintViolationException
+    S2->>DB: findByRequestToken -> ticket 36 -> replayOrReject: same content
+    S2-->>B: redirect to ticket 36 "already submitted"
+```
+
+**Pessimistic locking — SLA scheduler vs. agent resolving:** both call `lockTicket()`; whoever gets the row first
+finishes; the other re-reads: the scheduler sees "not overdue any more" (resolved) and does nothing, or the agent sees
+the new `version` and — if their form carried the old version — gets a conflict.
+
+> **বাংলায়:** তিন রকম সুরক্ষা: (১) pessimistic — row-এ তালা, অন্যরা অপেক্ষা করে; (২) optimistic — version মিলিয়ে
+> সেভ, না মিললে 409; (৩) idempotency — একই token দুবার এলে একটাই টিকিট। আর workload-এর মতো অনেক row-এর উপর
+> নির্ভরশীল সিদ্ধান্তের জন্য cache lock।
+
+## E12. Security boundaries **[I]**
+
+| Boundary | Enforced by |
+|---|---|
+| Internet → app | CSRF on every POST/PUT/PATCH/DELETE, session auth, `throttle:*`, login rate limit |
+| Logged-in → admin area | `role:admin` middleware **and** policy checks |
+| User → ticket | `TicketPolicy` (`view`, `update`, `assign`, `start`, `resolve`, `close`, `reopen`, `comment`, `addInternalNote`, `downloadAttachment`) |
+| Customer → other clients' data | `resolveScope()` (client from account), `scopeVisibleTo()` in SQL, dependent dropdown endpoint filtered |
+| Customer → internal content | `TicketComment/TicketActivity::scopeVisibleTo()`, `addInternalNote` policy, internal-note files staff-only |
+| Browser → WebSocket channels | `routes/channels.php` (`users.{id}` = same active user); payload only an id |
+| Browser → files | private disk, UUID names, policy-checked download, `nosniff`, `Content-Disposition: attachment` |
+| Logs | only ids in context (no passwords, cookies, ticket text) |
+| Secrets | `.env` git-ignored; only `VITE_REVERB_APP_KEY` (public) reaches the browser |
+
+## E13. Deployment architecture
+
+**Development (implemented, verified):** Windows, `php artisan serve` + `queue:work` + `reverb:start` + `schedule:work`,
+MariaDB 10.4 (XAMPP), log mailer.
+
+**Single-server production (documented in [18](18-PRODUCTION-DEPLOYMENT.md), NOT executed):**
+
+```mermaid
+flowchart TD
+    U["Users (HTTPS / WSS)"] --> NG["Nginx: TLS termination,<br/>static files, /app WebSocket proxy"]
+    NG -->|"PHP requests"| FPM["PHP-FPM 8.4: Laravel"]
+    NG -->|"WebSocket upgrade"| RV["Reverb (Supervisor)"]
+    FPM --> DB[("MySQL 8")]
+    FPM --> FS[("storage/app/private")]
+    QW["queue:work (Supervisor)"] --> DB
+    CR["cron: schedule:run every minute"] --> FPM2["tickets:check-sla"] --> DB
+    FPM -->|"broadcast HTTP"| RV
+    QW --> SMTP["SMTP provider"]
+```
+
+**Scaled production [F]:** load balancer → N app servers; Redis for cache/locks/queue/sessions; Reverb cluster with
+Redis scaling; S3 for attachments; MySQL primary + read replica; `onOneServer()` scheduler; central logs/metrics.
+
+## E14. Failure scenarios
+
+| Failure | What happens | Recovery | Status |
+|---|---|---|---|
+| Reverb down | Broadcast exception caught + logged; operation succeeds; browser polls every 5 s | Restart Reverb; Echo reconnects automatically | [I] tested |
+| Queue worker down | Email jobs wait in `jobs`; everything else works | Start worker; jobs are processed | [I] verified |
+| SMTP failing | 3 attempts, 10 s apart, then `failed_jobs` + log | Fix config, `queue:retry all` | [I] tested with fakes |
+| Worker crash mid-job | Job reappears after `retry_after`; de-dup key prevents most resends | automatic | [I] partial (best effort) |
+| Scheduler down | No reminders while down | Next run sends one reminder per pending breach | [I] |
+| Two scheduler runs overlap | `withoutOverlapping()` + row lock + `sla_notified_at` | — | [I] tested |
+| DB deadlock | `DB::transaction(..., 3)` retries | automatic, else error page | [I] |
+| Lock wait / assignment lock busy | "try again" message (5 s), lock auto-expires after 10 s | retry | [I] tested |
+| Database down | 500 pages; `/health/ready` returns 503 | Restart DB; restore from backup if needed ([19](19-BACKUP-AND-RECOVERY.md)) | [I] endpoint; restore drill **not performed** |
+| File write OK but DB transaction fails | Files deleted again by `AttachmentService::deleteFiles()` | — | [I] tested |
+| Attachment file missing on disk | 404 + error log | Restore from file backup | [I] |
+| Duplicate submit / browser retry | Idempotent replay | — | [I] tested (incl. 6 parallel processes) |
+| Stale form | 409 / redirect back with input | User reloads | [I] tested |
+
+## E15. Concepts explained with this project
+
+| Concept | In ResolveDesk |
+|---|---|
+| Modular monolith | One Laravel app; services grouped by responsibility |
+| MVC | Routes → controllers → models/services → Blade |
+| RBAC | `users.role` + `role:admin` |
+| Resource-level authorization | `TicketPolicy` per ticket, `downloadAttachment` per file, channel rule per user |
+| Logical client data isolation | Scope rules + `visibleTo()` scopes, one database |
+| ACID | `DB::transaction()` around ticket + activity + notification + attachment rows |
+| Race condition | Double resolve, parallel auto-assign, double create |
+| Pessimistic locking | `lockForUpdate()` / `sharedLock()` |
+| Optimistic locking | `version` + conditional UPDATE |
+| Atomic locking | `Cache::lock('ticket-assignment')` |
+| Deadlocks | Fixed lock order + retry 3 |
+| Idempotency | `request_token`; same-agent assignment no-op; email de-dup key |
+| Producer–consumer | Request → `jobs` → `queue:work` |
+| Asynchronous processing | Emails in the worker; SLA in the scheduler |
+| Event-driven communication | `UserNotificationCreated` broadcast |
+| WebSockets | Reverb + Echo private channels |
+| Cache-aside | `Cache::remember()` for admin stats and categories |
+| Database indexing | `(project_id,status)`, `(client_id,status)`, `(status,due_at)`, notifications feed index |
+| N+1 queries | `with()`, `withCount()`, `preventLazyLoading` |
+| Rate limiting | Named limiters, 429 |
+| Graceful degradation | Polling fallback, optional worker/scheduler |
+| Retry behaviour | Job retries/backoff, deadlock retries, Echo reconnect, lock `block()` |
+| Failure recovery | `failed_jobs` + `queue:retry`, scheduler catch-up, backups ([19](19-BACKUP-AND-RECOVERY.md)) |
+
+## E16. Scaling considerations **[F] unless marked**
+
+1. **Redis cache and queue** — switch `CACHE_STORE`/`QUEUE_CONNECTION`; locks and rate limiters follow the cache store.
+2. **Multiple Laravel app servers + load balancer** — same release everywhere, shared `APP_KEY`, health checks on
+   `/up` and `/health/ready` **[I: endpoints exist]**.
+3. **Shared session storage** — already shared through the database **[I]**; Redis at higher load.
+4. **Shared object storage** — `ATTACHMENT_DISK=s3`; code uses `Storage::disk(config(...))` **[I: configurable]**.
+5. **Multiple queue workers** — Supervisor `numprocs`; the job is already safe to retry (de-dup key, timeout < retry_after).
+6. **Reverb horizontal scaling** — Redis pub/sub (`REVERB_SCALING_ENABLED`), WebSocket-aware LB.
+7. **Scheduler** — `onOneServer()` with a shared cache.
+8. **Database read replicas** — reports/dashboards on replicas; locking and writes on the primary.
+9. **Centralized monitoring** — shipped logs (request id already present **[I]**), queue length, failed jobs, Reverb
+   connections, DB slow log.

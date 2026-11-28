@@ -7,12 +7,12 @@ use App\Mail\TicketUpdateMail;
 use App\Models\Category;
 use App\Models\Ticket;
 use App\Models\User;
-use App\Services\TicketService;
 use Exception;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
@@ -50,6 +50,7 @@ class QueueAndEmailTest extends TestCase
         $category = Category::factory()->create();
 
         $this->actingAs($customer)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'VAT is wrong', 'description' => 'x', 'category_id' => $category->id, 'priority' => 'high',
         ]);
 
@@ -74,6 +75,7 @@ class QueueAndEmailTest extends TestCase
         $category = Category::factory()->create();
 
         $this->actingAs($admin)->post('/tickets', [
+            'request_token' => (string) Str::uuid(),
             'subject' => 'Internal task', 'description' => 'x', 'category_id' => $category->id, 'priority' => 'low',
         ]);
 
@@ -106,7 +108,7 @@ class QueueAndEmailTest extends TestCase
         try {
             // An outer transaction that fails AFTER the assignment code has run.
             DB::transaction(function () use ($ticket, $agent, $admin) {
-                app(TicketService::class)->assignAgent($ticket, $agent, $admin);
+                app(TicketAssignmentService::class)->assignAgent($ticket, $agent, $admin);
                 throw new Exception('Something failed later in the same transaction');
             });
         } catch (Exception $exception) {

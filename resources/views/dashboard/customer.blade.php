@@ -12,17 +12,20 @@
 </div>
 
 <div class="row g-3 mb-4">
-    <div class="col-6 col-lg-3">
+    <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'My total tickets', 'value' => $counts['total'], 'icon' => 'bi-collection', 'color' => 'primary', 'link' => route('tickets.index')])
     </div>
-    <div class="col-6 col-lg-3">
+    <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'Active', 'value' => $counts['active'], 'icon' => 'bi-hourglass-split', 'color' => 'warning'])
     </div>
-    <div class="col-6 col-lg-3">
+    <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'Resolved (awaiting your confirmation)', 'value' => $counts['resolved'], 'icon' => 'bi-check2-circle', 'color' => 'success', 'link' => route('tickets.index', ['status' => 'resolved'])])
     </div>
-    <div class="col-6 col-lg-3">
+    <div class="col-6 col-lg">
         @include('dashboard._stat-card', ['label' => 'Closed', 'value' => $counts['closed'], 'icon' => 'bi-lock', 'color' => 'secondary', 'link' => route('tickets.index', ['status' => 'closed'])])
+    </div>
+    <div class="col-6 col-lg">
+        @include('dashboard._stat-card', ['label' => 'Overdue', 'value' => $counts['overdue'], 'icon' => 'bi-alarm', 'color' => 'danger', 'link' => route('tickets.index', ['overdue' => 1])])
     </div>
 </div>
 
@@ -51,5 +54,24 @@
             </tbody>
         </table>
     </div>
+</div>
+
+{{-- V2: the customer's own latest notifications (only notifications.notifiable_id = this user). --}}
+<div class="card mt-3">
+    <div class="card-header d-flex justify-content-between">
+        My recent notifications
+        <a href="{{ route('notifications.index') }}" class="small text-decoration-none fw-normal">View all</a>
+    </div>
+    <ul class="list-group list-group-flush small">
+        @forelse ($recentNotifications as $notification)
+            <li class="list-group-item d-flex justify-content-between gap-2 {{ $notification->read_at ? '' : 'fw-semibold' }}">
+                <span>{{ $notification->data['ticket_number'] ?? '' }} · {{ $notification->data['title'] ?? '' }}
+                    <span class="d-block fw-normal text-muted">{{ $notification->data['message'] ?? '' }}</span></span>
+                <span class="text-muted text-nowrap fw-normal">{{ $notification->created_at->diffForHumans() }}</span>
+            </li>
+        @empty
+            <li class="list-group-item text-muted">No notifications yet.</li>
+        @endforelse
+    </ul>
 </div>
 @endsection

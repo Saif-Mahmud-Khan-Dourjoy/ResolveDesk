@@ -21,9 +21,22 @@
         <div class="card">
             <div class="card-body p-4">
                 {{-- HTML forms only support GET/POST; @method('PUT') tells Laravel to treat it as PUT. --}}
-                <form method="POST" action="{{ route('tickets.update', $ticket) }}">
+                <form method="POST" action="{{ route('tickets.update', $ticket) }}" data-disable-on-submit>
                     @csrf
                     @method('PUT')
+                    {{-- Optimistic locking: the version this form was based on. If someone else changes
+                         the ticket first, saving fails with a conflict instead of overwriting their work.
+                         Always the CURRENT version (never old('version')): after a conflict the form is
+                         shown again with the user's input and a warning; saving again is then a
+                         deliberate decision. Re-sending the stale version would fail forever. --}}
+                    <input type="hidden" name="version" value="{{ $ticket->version }}">
+
+                    <div class="alert alert-light border small">
+                        <i class="bi bi-diagram-3 me-1"></i>
+                        Scope (cannot be changed): <strong>{{ $ticket->project?->displayName() ?? 'Global' }}</strong>
+                        · {{ $ticket->client?->name ?? 'Internal (no client)' }}
+                    </div>
+
                     @include('tickets._form', ['ticket' => $ticket])
 
                     @if (! $ticket->category->is_active)

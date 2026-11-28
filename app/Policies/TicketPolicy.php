@@ -3,6 +3,7 @@
 namespace App\Policies;
 
 use App\Models\Ticket;
+use App\Models\TicketAttachment;
 use App\Models\User;
 
 /**
@@ -29,9 +30,17 @@ class TicketPolicy
         return $this->isCreator($user, $ticket) || $this->isAssignedAgent($user, $ticket);
     }
 
-    /** Every active role may create tickets. */
+    /**
+     * Every active role may create tickets, except customers whose client
+     * organization has been deactivated (V2). Standalone customers may create
+     * global tickets.
+     */
     public function create(User $user): bool
     {
+        if ($user->isCustomer() && $user->client_id !== null) {
+            return (bool) $user->client?->is_active;
+        }
+
         return true;
     }
 
@@ -93,6 +102,30 @@ class TicketPolicy
     public function comment(User $user, Ticket $ticket): bool
     {
         return $this->view($user, $ticket) && ! $ticket->isClosed();
+    }
+
+    /** V2: internal notes - staff (admin/agent) who can view the ticket, not on closed tickets. */
+    public function addInternalNote(User $user, Ticket $ticket): bool
+    {
+        return $user->isStaff() && $this->comment($user, $ticket);
+    }
+
+    /**
+     * V2: attachment download. The user must be able to view the ticket, and a file
+     * attached to an INTERNAL note is staff-only (it inherits the note's visibility).
+     * Usage: Gate::authorize('downloadAttachment', [$ticket, $attachment]);
+     */
+    public function downloadAttachment(User $user, Ticket $ticket, TicketAttachment $attachment): bool
+    {
+        if ($attachment->ticket_id !== $ticket->id || ! $this->view($user, $ticket)) {
+            return false;
+        }
+
+        if ($attachment->ticket_comment_id !== null && $attachment->comment->isInternal()) {
+            return $user->isStaff();
+        }
+
+        return true;
     }
 
     // ---- Small helpers ------------------------------------------------------

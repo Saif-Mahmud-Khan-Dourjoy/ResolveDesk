@@ -35,6 +35,12 @@
                                 <td style="padding:10px 14px; color:#6b7280;">Subject</td>
                                 <td style="padding:10px 14px;">{{ $ticketSubject }}</td>
                             </tr>
+                            @if (! empty($projectName))
+                                <tr>
+                                    <td style="padding:10px 14px; color:#6b7280;">Project</td>
+                                    <td style="padding:10px 14px;">{{ $projectName }}</td>
+                                </tr>
+                            @endif
                             <tr>
                                 <td style="padding:10px 14px; color:#6b7280;">Status</td>
                                 <td style="padding:10px 14px;">{{ $statusLabel }}</td>
